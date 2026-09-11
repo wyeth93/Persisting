@@ -16,6 +16,10 @@ mod cas_store;
 #[cfg(feature = "lance-store")]
 mod catalog;
 #[cfg(feature = "lance-store")]
+mod chronicle_manifest;
+#[cfg(feature = "lance-store")]
+mod compact_jsonl;
+#[cfg(feature = "lance-store")]
 mod datafusion_bridge;
 #[cfg(feature = "lance-store")]
 pub(crate) mod dataset_write_lock;
@@ -30,13 +34,15 @@ mod events;
 #[cfg(feature = "lance-store")]
 mod files;
 #[cfg(feature = "lance-store")]
-mod index_build_gate;
+pub(crate) mod index_build_gate;
 #[cfg(feature = "lance-store")]
 mod inspect;
 #[cfg(feature = "lance-store")]
 mod local_query_manifest;
 #[cfg(feature = "lance-store")]
 mod location;
+#[cfg(feature = "lance-store")]
+pub(crate) mod opendal_store;
 #[cfg(feature = "lance-store")]
 mod query_engine;
 #[cfg(feature = "lance-store")]
@@ -65,6 +71,17 @@ pub use catalog::{
     CatalogSourceRevision, CatalogSourceStatus, CatalogStorylineKey, CatalogTrajectoryBundle,
     DEFAULT_DATASET_NAME, DEFAULT_MAX_EVENT_FALLBACK_BYTES, DEFAULT_MAX_EVENT_FALLBACK_ROWS,
     DatasetCatalogSnapshot, DatasetMount, DiscoveredSource, NamespacePath,
+};
+#[cfg(feature = "lance-store")]
+#[allow(unused_imports)]
+pub use chronicle_manifest::{
+    CHRONICLE_MANIFEST_FILE, ChronicleManifest, ManifestKind, ManifestStats, atomic_write_manifest,
+    compact_jsonl_manifest_matches, load_manifest, try_load_manifest, write_compact_jsonl_manifest,
+};
+#[cfg(feature = "lance-store")]
+pub use compact_jsonl::{
+    CompactJsonlColumn, CompactJsonlOffload, CompactJsonlOptions, CompactJsonlRecord,
+    CompactJsonlStore,
 };
 #[cfg(feature = "lance-store")]
 pub(crate) use document_source::{DocumentSourceImpl, open_document_source};
@@ -105,8 +122,9 @@ pub(crate) use local_query_manifest::{
 pub use location::{DatasetLocation, DatasetLocationKind};
 #[cfg(feature = "lance-store")]
 pub use query_engine::{
-    ChronicleQueryEngine, ChronicleQueryExecutionOptions, ExternalTableFormat, ExternalTableSpec,
-    IntrospectedField, IntrospectedTable, QueryBackendInfo, QuerySnapshot, QueryWriteOutcome,
+    ChronicleQueryEngine, ChronicleQueryExecutionOptions, DEFAULT_QUERY_MEMORY_LIMIT_BYTES,
+    ExternalTableFormat, ExternalTableSpec, IntrospectedField, IntrospectedTable, QueryBackendInfo,
+    QuerySnapshot, QueryWriteOutcome,
 };
 #[cfg(feature = "lance-store")]
 pub use run_control::{CommitRunOutcome, LeaseAcquireOutcome, RunControlStore};
@@ -119,12 +137,9 @@ pub use storyline::{
     StorylineContentOptions, StorylineContentReadMode, StorylineDataFusionTableNames,
     StorylineDataSource, StorylineDataSourceOptions, StorylineLanceStore,
     StorylineMaintenanceReport, StorylineProjectionLineage, StorylineStreamImportReport,
-    StorylineTableKind, StorylineTablePaths, search_storyline_documents_fts,
-    search_storyline_step_matches_fts, search_storyline_step_matches_fts_in_columns,
-    search_storyline_steps_fts, story_runs_arrow_schema, story_runs_from_batch,
+    StorylineTableKind, StorylineTablePaths, story_runs_arrow_schema, story_runs_from_batch,
     story_runs_to_batch, story_steps_arrow_schema, story_steps_from_batch, story_steps_to_batch,
     story_tool_calls_arrow_schema, story_tool_calls_from_batch, story_tool_calls_to_batch,
-    storyline_steps_fts_available,
 };
 #[cfg(feature = "lance-store")]
 pub use storyline_model::{

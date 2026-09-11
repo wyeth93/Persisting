@@ -1,4 +1,6 @@
 use super::*;
+use crate::store::chronicle_manifest::{ManifestKind, try_load_manifest};
+use crate::store::opendal_store::Store as OpendalStore;
 
 #[derive(Debug)]
 pub(super) enum Candidate {
@@ -14,6 +16,12 @@ pub(super) enum Candidate {
         size_bytes: Option<u64>,
         last_modified: Option<String>,
     },
+    Compact {
+        file: String,
+        uri: String,
+        size_bytes: Option<u64>,
+        last_modified: Option<String>,
+    },
     LocalFile {
         file: String,
         root: PathBuf,
@@ -23,8 +31,8 @@ pub(super) enum Candidate {
     },
     RemoteFile {
         file: String,
-        store: Arc<LanceObjectStore>,
-        meta: ObjectMeta,
+        store: OpendalStore,
+        meta: RemoteObjectMeta,
     },
 }
 
@@ -57,6 +65,21 @@ impl Candidate {
                 last_modified.clone(),
                 None,
             ),
+            Self::Compact {
+                file,
+                uri,
+                size_bytes,
+                last_modified,
+            } => (
+                file.clone(),
+                Some("compact-jsonl/v1".into()),
+                CatalogSourceKind::Store,
+                *size_bytes,
+                last_modified.clone(),
+                Some(CatalogSourceRevision::LocalFile {
+                    fingerprint: local_snapshot_ref(Path::new(uri)),
+                }),
+            ),
             Self::LocalFile {
                 file,
                 path,
@@ -78,7 +101,7 @@ impl Candidate {
                 None,
                 CatalogSourceKind::File,
                 Some(meta.size),
-                Some(meta.last_modified.to_rfc3339()),
+                Some(meta.last_modified.clone()),
                 Some(remote_source_revision(meta)),
             ),
         };
@@ -94,6 +117,8 @@ impl Candidate {
             last_modified,
             status: CatalogSourceStatus::Ready,
             error: None,
+            record_count: None,
+            failed_count: None,
         }
     }
 }
@@ -144,6 +169,24 @@ pub(super) async fn freeze_candidate(
                         snapshot,
                         projection: None,
                     },
+                    options,
+                    temporary_files,
+                )),
+            ))
+        }
+        Candidate::Compact { file, uri, .. } => {
+            if let Some(manifest) =
+                crate::store::chronicle_manifest::try_load_manifest(Path::new(&uri))
+                && let Some(stats) = manifest.stats
+            {
+                source_row.record_count = Some(stats.record_count);
+                source_row.failed_count = Some(stats.failed_count);
+            }
+            Ok((
+                source_row,
+                Arc::new(LazySource::new(
+                    file,
+                    LazySourceSpec::Compact { uri },
                     options,
                     temporary_files,
                 )),
@@ -463,13 +506,13 @@ pub(super) async fn discover_candidates(
     options: LocalQueryManifestOptions,
 ) -> Result<Vec<Candidate>> {
     if let Some(path) = local_mount_path(&mount.uri) {
-        discover_local_candidates(&mount.uri, &path, options)
+        discover_local_candidates(&mount.uri, &path, options).await
     } else {
         discover_object_candidates(&mount.uri, options).await
     }
 }
 
-fn discover_local_candidates(
+async fn discover_local_candidates(
     original_uri: &str,
     root: &Path,
     options: LocalQueryManifestOptions,
@@ -509,6 +552,10 @@ fn discover_local_candidates(
         "Dataset input is not a directory: {original_uri}"
     );
 
+    if let Some(manifest) = try_load_manifest(root) {
+        return collect_manifest_subtree(root, root, &manifest, options).await;
+    }
+
     if root.join("CURRENT").is_file() {
         let metadata = fs::metadata(root.join("CURRENT"))?;
         return Ok(vec![Candidate::Storyline {
@@ -523,6 +570,15 @@ fn discover_local_candidates(
     {
         let metadata = fs::metadata(root.join("_manifest.json"))?;
         return Ok(vec![Candidate::Events {
+            file: ".".into(),
+            uri: canonical_local_uri(root)?,
+            size_bytes: Some(metadata.len()),
+            last_modified: modified_string(&metadata),
+        }]);
+    }
+    if is_lance_directory(root) && is_compact_jsonl_directory(root).await? {
+        let metadata = fs::metadata(root)?;
+        return Ok(vec![Candidate::Compact {
             file: ".".into(),
             uri: canonical_local_uri(root)?,
             size_bytes: Some(metadata.len()),
@@ -551,7 +607,10 @@ fn discover_local_candidates(
             }
             let path = entry.path();
             if file_type.is_dir() {
-                if path.join("CURRENT").is_file() {
+                if let Some(manifest) = try_load_manifest(&path) {
+                    let nested = collect_manifest_subtree(root, &path, &manifest, options).await?;
+                    candidates.extend(nested);
+                } else if path.join("CURRENT").is_file() {
                     let metadata = fs::metadata(path.join("CURRENT"))?;
                     candidates.push(Candidate::Storyline {
                         file: relative_catalog_path(root, &path, true)?,
@@ -570,6 +629,15 @@ fn discover_local_candidates(
                         last_modified: modified_string(&metadata),
                     });
                 } else if is_lance_directory(&path) {
+                    if is_compact_jsonl_directory(&path).await? {
+                        let metadata = fs::metadata(&path)?;
+                        candidates.push(Candidate::Compact {
+                            file: relative_catalog_path(root, &path, true)?,
+                            uri: canonical_local_uri(&path)?,
+                            size_bytes: Some(metadata.len()),
+                            last_modified: modified_string(&metadata),
+                        });
+                    }
                     // Derived Lance datasets are sidecars of a canonical Run,
                     // not trajectory sources. Never descend into their internal
                     // metadata and register it as an outer file source.
@@ -597,18 +665,99 @@ fn discover_local_candidates(
     Ok(candidates)
 }
 
+async fn collect_manifest_subtree(
+    mount_root: &Path,
+    node: &Path,
+    manifest: &crate::store::ChronicleManifest,
+    options: LocalQueryManifestOptions,
+) -> Result<Vec<Candidate>> {
+    let mut candidates = Vec::new();
+    let mut stack = vec![(node.to_path_buf(), manifest.clone())];
+    while let Some((current, current_manifest)) = stack.pop() {
+        match current_manifest.kind {
+            ManifestKind::Leaf => {
+                anyhow::ensure!(
+                    current_manifest.is_compact_jsonl_leaf(),
+                    "chronicle.manifest leaf format {:?} is not supported for discovery yet",
+                    current_manifest.format
+                );
+                let metadata = fs::metadata(&current)?;
+                let file = if current == mount_root {
+                    ".".into()
+                } else {
+                    relative_catalog_path(mount_root, &current, true)?
+                };
+                candidates.push(Candidate::Compact {
+                    file,
+                    uri: canonical_local_uri(&current)?,
+                    size_bytes: Some(metadata.len()),
+                    last_modified: modified_string(&metadata),
+                });
+            }
+            ManifestKind::Branch => {
+                let mut entries = fs::read_dir(&current)
+                    .with_context(|| {
+                        format!("read chronicle.manifest branch {}", current.display())
+                    })?
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                entries.sort_by_key(|entry| entry.path());
+                for entry in entries.into_iter().rev() {
+                    anyhow::ensure!(
+                        candidates.len() < options.max_files,
+                        "Dataset manifest exceeds max_files limit of {}",
+                        options.max_files
+                    );
+                    let file_type = entry.file_type()?;
+                    if file_type.is_symlink() || !file_type.is_dir() {
+                        continue;
+                    }
+                    let child = entry.path();
+                    let Some(child_manifest) = try_load_manifest(&child) else {
+                        continue;
+                    };
+                    stack.push((child, child_manifest));
+                }
+            }
+        }
+        anyhow::ensure!(
+            candidates.len() <= options.max_files,
+            "Dataset manifest exceeds max_files limit of {}",
+            options.max_files
+        );
+    }
+    candidates.sort_by(|left, right| left.source_stub().file.cmp(&right.source_stub().file));
+    Ok(candidates)
+}
+
+async fn is_compact_jsonl_directory(path: &Path) -> Result<bool> {
+    if let Some(manifest) = try_load_manifest(path) {
+        return Ok(manifest.is_compact_jsonl_leaf());
+    }
+    let dataset = match lance::Dataset::open(path.to_string_lossy().as_ref()).await {
+        Ok(dataset) => dataset,
+        Err(_) => return Ok(false),
+    };
+    let is_compact = dataset
+        .schema()
+        .metadata
+        .get("pchronicle.format")
+        .is_some_and(|value| value == "compact-jsonl/v1");
+    if is_compact {
+        // Store-layer upgrade path for pre-manifest datasets: first discovery
+        // that opens Lance also publishes chronicle.manifest.
+        let _ = crate::store::CompactJsonlStore::ensure_manifest(path).await?;
+    }
+    Ok(is_compact)
+}
+
 async fn discover_object_candidates(
     uri: &str,
     options: LocalQueryManifestOptions,
 ) -> Result<Vec<Candidate>> {
-    let (store, root) = LanceObjectStore::from_uri(uri)
-        .await
-        .with_context(|| format!("open Dataset object store {uri}"))?;
-    let store = Arc::clone(&store);
-    let mut listing = store.inner.list(Some(&root));
+    let store = OpendalStore::from_uri(uri).await?;
     let mut metas = Vec::new();
-    while let Some(meta) = listing
-        .try_next()
+    for entry in store
+        .list("")
         .await
         .with_context(|| format!("list Dataset object prefix {uri}"))?
     {
@@ -617,16 +766,16 @@ async fn discover_object_candidates(
             "Dataset traversal exceeds max_entries limit of {}",
             options.max_entries
         );
-        metas.push(meta);
+        metas.push(RemoteObjectMeta::from(entry));
     }
     metas.sort_by(|left, right| left.location.cmp(&right.location));
 
-    let root_is_events = root.as_ref().ends_with("events.lance");
-    let mut storyline_roots = BTreeMap::<String, ObjectMeta>::new();
-    let mut event_roots = BTreeMap::<String, ObjectMeta>::new();
+    let root_is_events = uri.trim_end_matches('/').ends_with("events.lance");
+    let mut storyline_roots = BTreeMap::<String, RemoteObjectMeta>::new();
+    let mut event_roots = BTreeMap::<String, RemoteObjectMeta>::new();
     let mut relative_metas = Vec::with_capacity(metas.len());
     for meta in metas {
-        let relative = relative_object_path(&root, &meta.location)?;
+        let relative = meta.location.clone();
         if relative == "CURRENT" || relative.ends_with("/CURRENT") {
             storyline_roots.insert(parent_relative_path(&relative, "CURRENT"), meta.clone());
         }
@@ -647,7 +796,7 @@ async fn discover_object_candidates(
             file: root_source_path(relative),
             uri: child_uri(uri, relative),
             size_bytes: Some(meta.size),
-            last_modified: Some(meta.last_modified.to_rfc3339()),
+            last_modified: Some(meta.last_modified.clone()),
         });
     }
     for (relative, meta) in &event_roots {
@@ -658,7 +807,7 @@ async fn discover_object_candidates(
             file: root_source_path(relative),
             uri: child_uri(uri, relative),
             size_bytes: Some(meta.size),
-            last_modified: Some(meta.last_modified.to_rfc3339()),
+            last_modified: Some(meta.last_modified.clone()),
         });
     }
 
@@ -674,23 +823,19 @@ async fn discover_object_candidates(
             continue;
         }
         let candidate_path = if relative.is_empty() {
-            Path::new(root.as_ref())
+            Path::new(uri)
         } else {
             Path::new(&relative)
         };
         if is_json_candidate(candidate_path) {
             let file = if relative.is_empty() {
-                root.as_ref()
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("dataset.json")
-                    .to_string()
+                uri.rsplit('/').next().unwrap_or("dataset.json").to_string()
             } else {
                 relative
             };
             candidates.push(Candidate::RemoteFile {
                 file,
-                store: Arc::clone(&store),
+                store: store.clone(),
                 meta,
             });
         }

@@ -3,7 +3,6 @@
 mod agent;
 mod control;
 mod exchange;
-mod find;
 mod gateway_capture;
 mod gateway_ingest;
 mod gateway_partition;
@@ -12,13 +11,11 @@ mod output;
 mod projection_supervisor;
 pub mod server;
 mod settings;
+mod sync;
 
 #[cfg(test)]
 use exchange::rename_noreplace;
-use exchange::{run_export, run_import};
-use find::{
-    FindExpr, FindJsonOperator, FindJsonPredicate, FindTextPredicate, combine_match_expressions,
-};
+use exchange::{run_drop, run_export, run_import};
 use output::*;
 use settings::*;
 
@@ -42,6 +39,10 @@ use persisting_pchronicle::document::{
 };
 use persisting_pchronicle::model::StorylineDocument;
 use persisting_pchronicle::query::ChronicleQueryEngine;
+use persisting_pchronicle::search::{
+    FindExpr, FindJsonOperator, FindJsonPredicate, FindTextPredicate, combine_match_expressions,
+    search_storyline_step_matches_fts_in_columns,
+};
 use persisting_pchronicle::storage::{
     AutomaticProjectionInspection, AutomaticProjectionState, CatalogErrorPolicy,
     CatalogSnapshotOptions, CatalogSourceKind, CatalogSourceStatus, CatalogStorylineKey,
@@ -49,7 +50,6 @@ use persisting_pchronicle::storage::{
     EventFactSnapshot, ObjectStoreManifestWriteMode, StorylineLanceStore,
     StorylineProjectionBuildOutcome, automatic_projection_inventory, build_storyline_projection,
     inspect_automatic_storyline_projection, probe_canonical_event_store,
-    search_storyline_step_matches_fts_in_columns,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,13 +92,7 @@ pub fn error_exit_code(error: &anyhow::Error) -> u8 {
 )]
 pub struct Cli {
     /// Override the pChronicle user configuration file.
-    #[arg(
-        short = 'c',
-        long = "config",
-        global = true,
-        value_name = "FILE",
-        alias = "settings"
-    )]
+    #[arg(short = 'c', long = "config", global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
     /// Control stderr diagnostics without changing command results. For serve, also filters Warehouse request logs (target pchronicle.serve).
@@ -120,6 +114,63 @@ impl Cli {
 
     pub fn log_level(&self) -> LogLevel {
         self.log_level
+    }
+}
+
+/// Apply S3 backend keys from `--catalog-config` and local `@name` pin settings
+/// before the multi-threaded Tokio runtime starts. `std::env::set_var` after
+/// worker threads exist is racy on macOS and can leave OpenDAL unable to see
+/// `AWS_REGION`.
+pub fn apply_catalog_backend_env_before_runtime(cli: &Cli) -> Result<()> {
+    apply_serve_catalog_backend_env(cli)?;
+    apply_command_pin_backend_env(cli)?;
+    Ok(())
+}
+
+fn apply_serve_catalog_backend_env(cli: &Cli) -> Result<()> {
+    let Command::Serve(args) = &cli.command else {
+        return Ok(());
+    };
+    if args.command.is_some() || args.catalog_query_worker {
+        return Ok(());
+    }
+    let Some(path) = args.catalog_config.as_ref() else {
+        return Ok(());
+    };
+    let acl = server::catalog::CatalogAcl::load(path)?;
+    acl.apply_backend_env();
+    Ok(())
+}
+
+fn apply_command_pin_backend_env(cli: &Cli) -> Result<()> {
+    let reference = primary_dataset_reference(&cli.command);
+    apply_local_pin_backend_env_before_runtime(reference, cli.config.as_deref())
+}
+
+fn primary_dataset_reference(command: &Command) -> Option<&str> {
+    match command {
+        Command::List(args) => args.dataset_uri.as_deref(),
+        Command::Stats(args) => match &args.report {
+            None => args.health.dataset_uri.as_deref(),
+            Some(
+                StatsReport::Overview(options)
+                | StatsReport::Agents(options)
+                | StatsReport::Models(options)
+                | StatsReport::Tools(options),
+            ) => options.dataset_uri.as_deref(),
+        },
+        Command::Query(args) => args.dataset_uri.as_deref(),
+        Command::Find(args) => args.dataset_uri.as_deref(),
+        Command::Drop(args) => Some(args.dataset_uri.as_str()),
+        Command::Export(args) => args.from.as_deref(),
+        Command::Agent(args) => args.dataset_reference(),
+        Command::Import(args) => args.output.as_deref(),
+        Command::Onboard(_)
+        | Command::Dataset(_)
+        | Command::Sync(_)
+        | Command::Echo(_)
+        | Command::Dev(_)
+        | Command::Serve(_) => None,
     }
 }
 
@@ -147,11 +198,12 @@ impl<'a> DiagnosticWriter<'a> {
     }
 
     fn emit(&mut self, line: &[u8]) -> std::io::Result<()> {
+        let destructive_prompt = line.starts_with(b"Permanently ");
         let visible = match self.level {
-            LogLevel::Error => false,
+            LogLevel::Error => destructive_prompt,
             LogLevel::Warn => {
                 let text = String::from_utf8_lossy(line).to_ascii_lowercase();
-                text.contains("warning") || text.starts_with("warn")
+                destructive_prompt || text.contains("warning") || text.starts_with("warn")
             }
             LogLevel::Info | LogLevel::Debug => true,
         };
@@ -185,27 +237,36 @@ impl Write for DiagnosticWriter<'_> {
 enum Command {
     /// Learn the core pChronicle workflow with a guided Dataset walkthrough.
     Onboard(onboard::OnboardArgs),
-    /// Show, set, or clear the local default Dataset.
-    Default(DefaultArgs),
-    /// Manage named Dataset aliases, similar to git remote.
-    Alias(AliasArgs),
+    /// Pin, unpin, and list named Dataset roots (including the special `default` pin).
+    #[command(visible_alias = "ds")]
+    Dataset(DatasetArgs),
     /// List run data sources discovered under a Dataset URI.
-    #[command(visible_alias = "list")]
-    Ls(ListArgs),
-    /// Show Dataset health and aggregate statistics.
-    Status(StatusArgs),
+    #[command(visible_alias = "ls")]
+    List(ListArgs),
+    /// Dataset health counts and built-in statistical reports.
+    Stats(StatsArgs),
     /// Execute read-only SQL over one or more Datasets.
     Query(QueryArgs),
-    /// Run a stable built-in analysis over normalized run tables.
-    Analysis(AnalysisArgs),
     /// Start Codex or Claude with a pChronicle Dataset analysis skill.
     Agent(agent::AgentArgs),
     /// Locate a Run or Step by its source-local ID.
     Find(FindArgs),
-    /// Create a new Dataset from one or more run data sources.
+    /// Create, append to, or replace a Dataset from run data or compact JSONL.
+    ///
+    /// Compact JSONL stores each JSON object as one record without trajectory semantics.
+    /// Select it with either --input-format compact-jsonl or
+    /// --output-format compact-jsonl; it accepts local JSON/JSONL input and supports
+    /// create or replace, not stdin or append.
     Import(ImportArgs),
+    /// Permanently delete a Dataset directory or object-store prefix.
+    Drop(DropArgs),
     /// Export complete Trajectories to an exchange format.
     Export(ExportArgs),
+    /// Mirror a changing directory into snapshot Datasets.
+    ///
+    /// With --input-format compact-jsonl, each batch atomically replaces the
+    /// compact Lance Dataset at --convert; --to remains required but is not written.
+    Sync(sync::SyncArgs),
     /// Run a deterministic local LLM upstream for Gateway testing.
     #[command(hide = true)]
     Echo(EchoArgs),
@@ -213,12 +274,12 @@ enum Command {
     #[command(hide = true)]
     Dev(DevArgs),
     /// Run explicitly enabled Warehouse, Control, and Gateway services.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 }
 
 #[derive(Debug, Args)]
 struct ListArgs {
-    /// Dataset path, URI, or alias. Uses the default Dataset when omitted.
+    /// Dataset path, URI, or dataset pin. Uses the default Dataset when omitted.
     #[arg(value_name = "DATASET_URI")]
     dataset_uri: Option<String>,
 
@@ -244,72 +305,51 @@ struct ListArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(args_conflicts_with_subcommands = true)]
-struct DefaultArgs {
-    #[command(subcommand)]
-    command: Option<DefaultCommand>,
-
-    /// Compatibility form for `default set DIRECTORY`.
-    #[arg(value_name = "DIRECTORY", hide = true)]
-    legacy_directory: Option<PathBuf>,
-}
-
-#[derive(Debug, Subcommand)]
-enum DefaultCommand {
-    /// Show the configured local default Dataset.
-    Show,
-    /// Set the local default Dataset, creating the directory when needed.
-    Set {
-        #[arg(value_name = "LOCAL_DATASET")]
-        dataset: String,
-    },
-    /// Clear the default without deleting Dataset data.
-    Clear,
-}
-
-#[derive(Debug, Args)]
 #[command(after_help = r#"Examples:
-  pchronicle alias list
-  pchronicle alias add local ./trajectory-data
-  pchronicle alias add prod s3://bucket/evals
-  pchronicle alias add secure s3://bucket/evals --ak "$AWS_ACCESS_KEY_ID" --sk "$AWS_SECRET_ACCESS_KEY"
-  pchronicle alias add minio s3://bucket/evals --endpoint http://127.0.0.1:9000 --ak 123 --sk 123
-  pchronicle alias add regional s3://bucket/evals --region us-west-2
-  pchronicle alias add team catalog://127.0.0.1:8081 --ak USER_AK --sk USER_SK
-  pchronicle alias get-url prod
-  pchronicle alias set-url prod s3://new-bucket/evals
-  pchronicle status @prod
+  pchronicle dataset pin default ./trajectory-data
+  pchronicle dataset pin local ./trajectory-data
+  pchronicle dataset pin prod s3://bucket/evals
+  pchronicle dataset pin secure s3://bucket/evals --ak "$AWS_ACCESS_KEY_ID" --sk "$AWS_SECRET_ACCESS_KEY"
+  pchronicle dataset pin minio s3://bucket/evals --endpoint http://127.0.0.1:9000 --ak 123 --sk 123
+  pchronicle dataset pin regional s3://bucket/evals --region us-west-2
+  pchronicle dataset pin team catalog://127.0.0.1:8081 --ak USER_AK --sk USER_SK
+  pchronicle dataset list
+  pchronicle dataset show prod
+  pchronicle dataset set prod s3://new-bucket/evals
+  pchronicle dataset unpin prod
+  pchronicle stats @prod
+
+`default` is a reserved pin name for the Dataset used when a command omits
+DATASET_URI. It must be a local directory.
 
 S3 credentials are stored separately from the URI and are never printed by
-`alias list` or `alias get-url`. Use the standard AWS credential environment
-variables when possible; `--ak` and `--sk` are intended for a configured alias.
+`dataset list` or `dataset show`. Use the standard AWS credential environment
+variables when possible; `--ak` and `--sk` are intended for a configured pin.
 S3-compatible endpoints can be stored separately with `--endpoint URL` and are
-applied as AWS_ENDPOINT_URL_S3 when the alias is used.
+applied as AWS_ENDPOINT_URL_S3 when the pin is used.
 HTTP endpoints automatically enable AWS_ALLOW_HTTP for local S3-compatible
 services such as MinIO.
-An optional `--region REGION` is stored per alias; when omitted, the client
-falls back to `us-west-2` only when it needs a region.
-A `catalog://127.0.0.1:PORT` alias is a Directory locator: `@team/prod` fetches a
+An optional `--region REGION` is stored per pin; when omitted for an
+`s3://` pin, pChronicle applies `AWS_REGION` / `AWS_DEFAULT_REGION` as
+`us-west-2` before opening the store (OpenDAL requires a region).
+Endpoint, region, and credentials are applied before the Tokio runtime starts
+so local MinIO-style endpoints work without exporting AWS_* in the shell.
+A `catalog://127.0.0.1:PORT` pin is a Directory locator: `@team/prod` fetches a
 ticket and opens the ticket path. User `--ak/--sk` are required;
 `--endpoint` and `--region` are not accepted. Backend object-store keys stay on
 the Directory server and are not written to config.toml.
-The built-in aliases `@codex`, `@claude`, and `@claude-code` are always listed
+The built-in pins `@codex`, `@claude`, and `@claude-code` are always listed
 and resolve to the corresponding local Agent session roots."#)]
 #[command(args_conflicts_with_subcommands = true)]
-struct AliasArgs {
+struct DatasetArgs {
     #[command(subcommand)]
-    command: Option<AliasCommand>,
+    command: Option<DatasetCommand>,
 }
 
 #[derive(Debug, Subcommand)]
-enum AliasCommand {
-    /// List configured aliases.
-    List {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
-        format: OutputFormat,
-    },
-    /// Add a new alias.
-    Add {
+enum DatasetCommand {
+    /// Pin a Dataset root under a local name (`@NAME`).
+    Pin {
         #[arg(value_name = "NAME")]
         name: String,
         #[arg(value_name = "DATASET")]
@@ -317,7 +357,7 @@ enum AliasCommand {
         /// S3-compatible service endpoint, stored separately from the Dataset URI.
         #[arg(long, value_name = "URL")]
         endpoint: Option<String>,
-        /// S3 region. If omitted, the client default (`us-west-2`) is used when needed.
+        /// S3 region. If omitted for s3:// pins, defaults to us-west-2.
         #[arg(long, value_name = "REGION")]
         region: Option<String>,
         /// S3 access key ID. Must be provided together with --sk.
@@ -337,24 +377,35 @@ enum AliasCommand {
         )]
         secret_key: Option<String>,
     },
-    /// Print an alias target.
-    GetUrl {
+    /// Remove a pinned name without deleting Dataset data.
+    Unpin {
         #[arg(value_name = "NAME")]
         name: String,
     },
-    /// Change an existing alias target.
-    SetUrl {
+    /// List pinned Dataset names.
+    #[command(visible_alias = "ls")]
+    List {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+        format: OutputFormat,
+    },
+    /// Print a pin target URI.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Change an existing pin target.
+    Set {
         #[arg(value_name = "NAME")]
         name: String,
         #[arg(value_name = "DATASET")]
         dataset: String,
-        /// Replace the S3-compatible service endpoint stored for this alias.
+        /// Replace the S3-compatible service endpoint stored for this pin.
         #[arg(long, value_name = "URL")]
         endpoint: Option<String>,
-        /// Replace the S3 region stored for this alias.
+        /// Replace the S3 region stored for this pin.
         #[arg(long, value_name = "REGION")]
         region: Option<String>,
-        /// Replace the S3 access key ID stored for this alias.
+        /// Replace the S3 access key ID stored for this pin.
         #[arg(
             long = "ak",
             alias = "access-key",
@@ -362,7 +413,7 @@ enum AliasCommand {
             requires = "secret_key"
         )]
         access_key: Option<String>,
-        /// Replace the S3 secret access key stored for this alias.
+        /// Replace the S3 secret access key stored for this pin.
         #[arg(
             long = "sk",
             alias = "secret-key",
@@ -371,23 +422,18 @@ enum AliasCommand {
         )]
         secret_key: Option<String>,
     },
-    /// Rename an existing alias.
+    /// Rename an existing pin.
     Rename {
         #[arg(value_name = "OLD")]
         old: String,
         #[arg(value_name = "NEW")]
         new: String,
     },
-    /// Remove an alias without deleting its Dataset.
-    Remove {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
 }
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    /// Dataset path, URI, or alias. Uses the default Dataset when omitted.
+    /// Dataset path, URI, or dataset pin. Uses the default Dataset when omitted.
     #[arg(value_name = "DATASET_URI")]
     dataset_uri: Option<String>,
 
@@ -467,14 +513,22 @@ struct QueryArgs {
     max_entries: usize,
 }
 
+/// Dataset health counts and built-in statistical reports.
+///
+/// Bare `stats` reports Dataset health and aggregate counts. Subcommands such as
+/// `overview`, `agents`, `models`, and `tools` run the former analysis reports.
 #[derive(Debug, Args)]
-struct AnalysisArgs {
+#[command(args_conflicts_with_subcommands = true)]
+struct StatsArgs {
     #[command(subcommand)]
-    command: AnalysisCommand,
+    report: Option<StatsReport>,
+
+    #[command(flatten)]
+    health: StatusArgs,
 }
 
 #[derive(Debug, Subcommand)]
-enum AnalysisCommand {
+enum StatsReport {
     /// Summarize Sources, trajectories, Steps, Agents, Models, and tools.
     #[command(visible_alias = "summary")]
     Overview(AnalysisOptions),
@@ -489,7 +543,7 @@ enum AnalysisCommand {
 
 #[derive(Debug, Args)]
 struct AnalysisOptions {
-    /// Dataset path, URI, or alias. Uses the default Dataset when omitted.
+    /// Dataset path, URI, or dataset pin. Uses the default Dataset when omitted.
     #[arg(value_name = "DATASET_URI")]
     dataset_uri: Option<String>,
 
@@ -526,7 +580,7 @@ struct AnalysisOptions {
         .args(["document_id", "run_id", "session_id"])
 ))]
 struct FindArgs {
-    /// Dataset path, URI, or alias. Uses the default Dataset when omitted.
+    /// Dataset path, URI, or dataset pin. Uses the default Dataset when omitted.
     #[arg(value_name = "DATASET_URI")]
     dataset_uri: Option<String>,
 
@@ -591,6 +645,8 @@ enum ExchangeFormat {
     Codex,
     #[value(name = "claude-code")]
     ClaudeCode,
+    #[value(name = "compact-jsonl")]
+    CompactJsonl,
 }
 
 impl ExchangeFormat {
@@ -603,6 +659,7 @@ impl ExchangeFormat {
             Self::Storyline => "storyline",
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::CompactJsonl => "compact-jsonl",
         }
     }
 }
@@ -620,6 +677,8 @@ enum ExportFormat {
     #[value(name = "openai-messages")]
     OpenaiMessages,
     Storyline,
+    #[value(name = "compact-jsonl")]
+    CompactJsonl,
 }
 
 impl From<ExportFormat> for ExchangeFormat {
@@ -629,6 +688,7 @@ impl From<ExportFormat> for ExchangeFormat {
             ExportFormat::Actf => Self::Actf,
             ExportFormat::OpenaiMessages => Self::OpenaiMessages,
             ExportFormat::Storyline => Self::Storyline,
+            ExportFormat::CompactJsonl => Self::CompactJsonl,
         }
     }
 }
@@ -639,6 +699,27 @@ enum ImportOutputFormat {
     Preserve,
     /// Decode all input Sources into one squashed Storyline Lance Store at the Dataset root.
     Storyline,
+    /// Store JSONL rows in one columnar compact JSONL Lance Dataset.
+    #[value(name = "compact-jsonl")]
+    CompactJsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ImportMode {
+    /// Require a new destination and publish it atomically.
+    Create,
+    /// Add trajectories to an existing Storyline Dataset.
+    Append,
+    /// Import into a staging path, then atomically replace an existing local Dataset.
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DuplicateIdPolicy {
+    /// Add #N to a colliding document ID.
+    Suffix,
+    /// Skip a trajectory whose document ID already exists.
+    Skip,
 }
 
 impl ImportOutputFormat {
@@ -646,6 +727,7 @@ impl ImportOutputFormat {
         match self {
             Self::Preserve => "preserve",
             Self::Storyline => "storyline-lance",
+            Self::CompactJsonl => "compact-jsonl",
         }
     }
 }
@@ -656,18 +738,30 @@ struct ImportArgs {
     #[arg(short = 'f', long = "from", value_name = "PATH_OR_STDIN")]
     from: String,
 
-    /// New Dataset directory or object-store URI.
-    #[arg(short = 't', long = "to", alias = "output", value_name = "NEW_DATASET")]
+    /// Destination Dataset directory or object-store URI.
+    #[arg(short = 't', long = "to", alias = "output", value_name = "DATASET")]
     output: Option<String>,
 
-    /// Input exchange format. Auto detects each regular file from name and content.
-    /// Directory imports skip JSON that is not a supported run data format.
+    /// Input exchange format. Auto detects run data; compact-jsonl is explicit.
+    /// Compact JSONL recursively reads local .json, .jsonl, or .ndjson files.
     #[arg(short = 'i', long = "input-format", alias = "format", value_enum, default_value_t = ExchangeFormat::Auto)]
     format: ExchangeFormat,
 
-    /// Dataset layout: preserve source files, or combine them into one Storyline Lance Store at the Dataset root.
+    /// Dataset layout: preserve, normalized Storyline (combine all inputs into one Storyline Lance Store at the Dataset root), or record-level compact JSONL.
     #[arg(short = 'o', long = "output-format", value_enum)]
     output_format: Option<ImportOutputFormat>,
+
+    /// Destination behavior: create a new Dataset, append, or replace.
+    #[arg(long, value_enum, default_value_t = ImportMode::Create)]
+    mode: ImportMode,
+
+    /// How append handles an existing document ID.
+    #[arg(long, value_enum, value_name = "suffix|skip")]
+    on_duplicate: Option<DuplicateIdPolicy>,
+
+    /// Skip the destructive confirmation required by --mode replace.
+    #[arg(short = 'y', long)]
+    yes: bool,
 
     /// Compatibility no-op; stdin is selected by --from -.
     #[arg(long, hide = true)]
@@ -676,6 +770,23 @@ struct ImportArgs {
     /// Maximum bytes accepted from each Source, or from stdin in total.
     #[arg(long, value_parser = parse_byte_size, default_value = "256MiB")]
     max_input_bytes: Option<usize>,
+
+    /// Compact JSONL mapping. id/timestamp override $.id/$.timestamp; missing or invalid id values
+    /// use source_filename#line_number; other names add JSONB columns.
+    /// Example: --column id=$.event.id --column model=$.payload.model.
+    #[arg(long = "column", value_name = "NAME=JSON_PATH", action = clap::ArgAction::Append)]
+    columns: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct DropArgs {
+    /// Dataset path, URI, or dataset pin to permanently delete.
+    #[arg(value_name = "DATASET")]
+    dataset_uri: String,
+
+    /// Skip the destructive confirmation prompt.
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -778,7 +889,7 @@ struct ExportArgs {
     )
 )]
 struct ServeArgs {
-    /// Issue catalog users or change grants without starting Warehouse.
+    /// Manage Directory ACL or start Warehouse without a catalog subcommand.
     #[command(subcommand)]
     command: Option<ServeSubcommand>,
 
@@ -868,8 +979,10 @@ struct ServeArgs {
     #[arg(long = "gateway-debug", alias = "debug", requires = "gateway_config")]
     debug: bool,
 
-    /// Directory ACL file (libraries + users). Enables catalog:// locators and
-    /// per-user query workers for the Web API.
+    /// Directory ACL file (libraries + users). Mounts every [datasets.*] entry
+    /// into Warehouse and enables catalog:// locators. Mutually exclusive with
+    /// positional Dataset mounts. Apply S3 endpoint/region/keys from the file
+    /// before opening stores.
     #[arg(
         long = "catalog-config",
         value_name = "FILE",
@@ -884,7 +997,7 @@ struct ServeArgs {
 
 #[derive(Debug, Subcommand)]
 enum ServeSubcommand {
-    /// Issue catalog users and grant libraries without starting HTTP.
+    /// Manage Directory ACL (users, grants, datasets) without starting HTTP.
     Catalog(CatalogManageArgs),
 }
 
@@ -909,6 +1022,68 @@ enum CatalogCommand {
     Grant(CatalogGrantArgs),
     /// Remove library names from a user's grants.
     Revoke(CatalogRevokeArgs),
+    /// Add, remove, or list datasets (libraries) in the catalog file.
+    Dataset(CatalogDatasetManageArgs),
+}
+
+#[derive(Debug, Args)]
+struct CatalogDatasetManageArgs {
+    #[command(subcommand)]
+    command: CatalogDatasetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogDatasetCommand {
+    /// Register a dataset URI in the catalog file.
+    Add(CatalogDatasetAddArgs),
+    /// Remove dataset entries that are not referenced by grants.
+    Remove(CatalogDatasetRemoveArgs),
+    /// List datasets without printing backend secrets.
+    List(CatalogDatasetListArgs),
+}
+
+#[derive(Debug, Args)]
+struct CatalogDatasetAddArgs {
+    #[command(flatten)]
+    file: CatalogFileArg,
+    /// Library / mount name (becomes the Warehouse dataset name).
+    #[arg(value_name = "NAME")]
+    name: String,
+    /// Dataset URI (local path or s3://bucket/prefix).
+    #[arg(long = "uri", value_name = "URI")]
+    uri: String,
+    /// S3-compatible endpoint for this library (required consistency across s3:// entries).
+    #[arg(long = "endpoint", value_name = "URL")]
+    endpoint: Option<String>,
+    /// S3 region for this library (required for s3:// when not relying on process env).
+    #[arg(long = "region", value_name = "REGION")]
+    region: Option<String>,
+    /// Backend object-store access key (not a Directory user key).
+    #[arg(long = "access-key", value_name = "KEY")]
+    access_key: Option<String>,
+    /// Backend object-store secret key (not a Directory user key).
+    #[arg(long = "secret-key", value_name = "KEY")]
+    secret_key: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct CatalogDatasetRemoveArgs {
+    #[command(flatten)]
+    file: CatalogFileArg,
+    #[arg(value_name = "NAME", required = true, num_args = 1..)]
+    names: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct CatalogDatasetListArgs {
+    #[command(flatten)]
+    file: CatalogFileArg,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -1362,16 +1537,27 @@ pub async fn run_with_stdio(
             )
             .await
         }
-        Command::Default(args) => run_default(args, config, stdout, &mut diagnostics),
-        Command::Alias(args) => {
-            run_alias(args, config, stdout_is_terminal, stdout, &mut diagnostics)
+        Command::Dataset(args) => {
+            run_dataset(args, config, stdout_is_terminal, stdout, &mut diagnostics)
         }
-        Command::Ls(args) => {
+        Command::List(args) => {
             run_list(args, config, stdout_is_terminal, stdout, &mut diagnostics).await
         }
-        Command::Status(args) => {
-            run_status(args, config, stdout_is_terminal, stdout, &mut diagnostics).await
-        }
+        Command::Stats(args) => match args.report {
+            None => {
+                run_status(
+                    args.health,
+                    config,
+                    stdout_is_terminal,
+                    stdout,
+                    &mut diagnostics,
+                )
+                .await
+            }
+            Some(report) => {
+                run_stats_report(report, config, stdout_is_terminal, stdout, &mut diagnostics).await
+            }
+        },
         Command::Query(args) => {
             run_query(
                 args,
@@ -1382,9 +1568,6 @@ pub async fn run_with_stdio(
                 &mut diagnostics,
             )
             .await
-        }
-        Command::Analysis(args) => {
-            run_analysis(args, config, stdout_is_terminal, stdout, &mut diagnostics).await
         }
         Command::Agent(args) => agent::run(
             args,
@@ -1398,8 +1581,30 @@ pub async fn run_with_stdio(
         Command::Find(args) => {
             run_find(args, config, stdout_is_terminal, stdout, &mut diagnostics).await
         }
-        Command::Import(args) => run_import(args, config, stdin, stdout, &mut diagnostics).await,
+        Command::Import(args) => {
+            run_import(
+                args,
+                config,
+                stdin_is_terminal,
+                stdin,
+                stdout,
+                &mut diagnostics,
+            )
+            .await
+        }
+        Command::Drop(args) => {
+            run_drop(
+                args,
+                config,
+                stdin_is_terminal,
+                stdin,
+                stdout,
+                &mut diagnostics,
+            )
+            .await
+        }
         Command::Export(args) => run_export(args, config, stdout, &mut diagnostics).await,
+        Command::Sync(args) => sync::run(args, &mut diagnostics).await,
         Command::Echo(args) => run_echo(args, &mut diagnostics).await,
         Command::Dev(DevArgs {
             command: DevCommand::Echo(args),
@@ -1411,7 +1616,7 @@ pub async fn run_with_stdio(
             if let Some(command) = args.command {
                 return run_serve_catalog(command, stdout_is_terminal, stdout, &mut diagnostics);
             }
-            run_serve(args, config, cli.log_level, stdout, &mut diagnostics).await
+            run_serve(*args, config, cli.log_level, stdout, &mut diagnostics).await
         }
     }
 }
@@ -1853,6 +2058,45 @@ fn run_serve_catalog(
                 &datasets,
             )
         }
+        CatalogCommand::Dataset(dataset) => match dataset.command {
+            CatalogDatasetCommand::Add(add) => {
+                let library = server::catalog::add_dataset(
+                    &add.file.catalog_config,
+                    server::catalog::DatasetAddSpec {
+                        name: add.name,
+                        uri: add.uri,
+                        endpoint: add.endpoint,
+                        region: add.region,
+                        access_key: add.access_key,
+                        secret_key: add.secret_key,
+                    },
+                )?;
+                write_catalog_updated(stderr, &add.file.catalog_config)?;
+                write_catalog_dataset(
+                    stdout,
+                    resolve_output_format(add.format, stdout_is_terminal),
+                    &library,
+                )
+            }
+            CatalogDatasetCommand::Remove(remove) => {
+                let remaining =
+                    server::catalog::remove_datasets(&remove.file.catalog_config, &remove.names)?;
+                write_catalog_updated(stderr, &remove.file.catalog_config)?;
+                write_catalog_dataset_names(
+                    stdout,
+                    resolve_output_format(remove.format, stdout_is_terminal),
+                    &remaining,
+                )
+            }
+            CatalogDatasetCommand::List(list) => {
+                let libraries = server::catalog::list_datasets_config(&list.file.catalog_config)?;
+                write_catalog_datasets(
+                    stdout,
+                    resolve_output_format(list.format, stdout_is_terminal),
+                    &libraries,
+                )
+            }
+        },
     }
 }
 
@@ -1918,6 +2162,70 @@ fn write_user_grants(
     }
 }
 
+fn write_catalog_dataset(
+    stdout: &mut dyn Write,
+    format: OutputFormat,
+    library: &server::catalog::CatalogLibraryPublic,
+) -> Result<()> {
+    match format {
+        OutputFormat::Table => {
+            writeln!(stdout, "NAME\tURI")?;
+            writeln!(stdout, "{}\t{}", library.name, library.uri)
+                .context("write catalog dataset table")
+        }
+        OutputFormat::Json => {
+            serde_json::to_writer(&mut *stdout, library).context("write catalog dataset JSON")?;
+            writeln!(stdout).context("finish catalog dataset JSON")
+        }
+        OutputFormat::Auto => unreachable!("auto output format was resolved"),
+    }
+}
+
+fn write_catalog_datasets(
+    stdout: &mut dyn Write,
+    format: OutputFormat,
+    libraries: &[server::catalog::CatalogLibraryPublic],
+) -> Result<()> {
+    match format {
+        OutputFormat::Table => {
+            writeln!(stdout, "NAME\tURI")?;
+            for library in libraries {
+                writeln!(stdout, "{}\t{}", library.name, library.uri)
+                    .context("write catalog dataset row")?;
+            }
+            Ok(())
+        }
+        OutputFormat::Json => {
+            serde_json::to_writer(&mut *stdout, libraries)
+                .context("write catalog datasets JSON")?;
+            writeln!(stdout).context("finish catalog datasets JSON")
+        }
+        OutputFormat::Auto => unreachable!("auto output format was resolved"),
+    }
+}
+
+fn write_catalog_dataset_names(
+    stdout: &mut dyn Write,
+    format: OutputFormat,
+    names: &[String],
+) -> Result<()> {
+    match format {
+        OutputFormat::Table => {
+            writeln!(stdout, "NAME")?;
+            for name in names {
+                writeln!(stdout, "{name}").context("write catalog dataset name")?;
+            }
+            Ok(())
+        }
+        OutputFormat::Json => {
+            serde_json::to_writer(&mut *stdout, &serde_json::json!({ "datasets": names }))
+                .context("write catalog dataset names JSON")?;
+            writeln!(stdout).context("finish catalog dataset names JSON")
+        }
+        OutputFormat::Auto => unreachable!("auto output format was resolved"),
+    }
+}
+
 async fn run_serve(
     args: ServeArgs,
     settings_override: Option<&Path>,
@@ -1932,7 +2240,18 @@ async fn run_serve(
     }
     let catalog_only = args.catalog_config.is_some();
     let config = if catalog_only {
-        server::ChronicleServerConfig::front_only()
+        // Projection supervisor still needs the mount list; Warehouse prepare
+        // reloads the same catalog. Avoid front_only here so Gateway/Control
+        // siblings see the configured datasets.
+        let acl = server::catalog::CatalogAcl::load(
+            args.catalog_config
+                .as_ref()
+                .expect("catalog_only implies catalog_config"),
+        )?;
+        // OpenDAL/Lance read AWS_* from the process environment. Apply catalog
+        // backend keys before any discover/projection work touches s3:// mounts.
+        acl.apply_backend_env();
+        server::ChronicleServerConfig::mounted(acl.mounts()?)?
     } else {
         resolve_serve_config_with_settings(&args, settings_override)?
     };
@@ -1968,7 +2287,7 @@ async fn run_serve(
                 .with_context(|| format!("bind pChronicle Warehouse to {listen}"))?;
             let warehouse = if let Some(path) = args.catalog_config.as_ref() {
                 let acl = server::catalog::CatalogAcl::load(path)?;
-                server::PreparedWarehouse::prepare_catalog_front(acl).await?
+                server::PreparedWarehouse::prepare_catalog(acl).await?
             } else if args.gateway.is_some() {
                 server::PreparedWarehouse::prepare_live(config.clone()).await?
             } else {
@@ -2347,6 +2666,24 @@ async fn run_list(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
+    if let Some(reference) = args.dataset_uri.as_deref() {
+        let reference = reference.to_owned();
+        let settings_path = settings_override.map(Path::to_path_buf);
+        let listing = tokio::task::spawn_blocking(move || {
+            list_catalog_pin_datasets(&reference, settings_path.as_deref())
+        })
+        .await
+        .context("list catalog pin datasets")??;
+        if let Some(listing) = listing {
+            return write_catalog_pin_dataset_list(
+                listing,
+                args.format,
+                stdout_is_terminal,
+                stdout,
+                stderr,
+            );
+        }
+    }
     let dataset_uri = resolve_dataset_uri(args.dataset_uri.as_deref(), settings_override)?;
     let (dataset_uri, snapshot) =
         discover_snapshot(&dataset_uri, args.errors, args.max_files, args.max_entries).await?;
@@ -2384,6 +2721,52 @@ async fn run_list(
         dataset.error_source_count(),
     )
     .context("write pChronicle ls metadata")?;
+    Ok(())
+}
+
+fn write_catalog_pin_dataset_list(
+    listing: CatalogPinDatasetList,
+    format: OutputFormat,
+    stdout_is_terminal: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let output_format = match format {
+        OutputFormat::Auto if stdout_is_terminal => OutputFormat::Table,
+        OutputFormat::Auto => OutputFormat::Json,
+        explicit => explicit,
+    };
+    match output_format {
+        OutputFormat::Table => {
+            writeln!(stdout, "DATASET\tURI\tENDPOINT\tREGION")
+                .context("write catalog ls header")?;
+            for dataset in &listing.datasets {
+                writeln!(
+                    stdout,
+                    "{}\t{}\t{}\t{}",
+                    dataset.name,
+                    dataset.uri,
+                    dataset.endpoint.as_deref().unwrap_or("-"),
+                    dataset.region.as_deref().unwrap_or("-"),
+                )
+                .context("write catalog ls row")?;
+            }
+        }
+        OutputFormat::Json => {
+            serde_json::to_writer_pretty(&mut *stdout, &listing)
+                .context("encode catalog pin ls JSON")?;
+            writeln!(stdout).context("write catalog pin ls JSON")?;
+        }
+        OutputFormat::Auto => unreachable!("auto output format was resolved"),
+    }
+    writeln!(
+        stderr,
+        "pin={} catalog={} datasets={}",
+        listing.pin,
+        listing.catalog,
+        listing.datasets.len(),
+    )
+    .context("write catalog pin ls metadata")?;
     Ok(())
 }
 
@@ -2672,18 +3055,18 @@ async fn run_query(
     Ok(())
 }
 
-async fn run_analysis(
-    args: AnalysisArgs,
+async fn run_stats_report(
+    report: StatsReport,
     settings_override: Option<&Path>,
     stdout_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let (analysis, options, sql) = match args.command {
-        AnalysisCommand::Overview(options) => ("overview", options, ANALYSIS_OVERVIEW_SQL),
-        AnalysisCommand::Agents(options) => ("agents", options, ANALYSIS_AGENTS_SQL),
-        AnalysisCommand::Models(options) => ("models", options, ANALYSIS_MODELS_SQL),
-        AnalysisCommand::Tools(options) => ("tools", options, ANALYSIS_TOOLS_SQL),
+    let (analysis, options, sql) = match report {
+        StatsReport::Overview(options) => ("overview", options, ANALYSIS_OVERVIEW_SQL),
+        StatsReport::Agents(options) => ("agents", options, ANALYSIS_AGENTS_SQL),
+        StatsReport::Models(options) => ("models", options, ANALYSIS_MODELS_SQL),
+        StatsReport::Tools(options) => ("tools", options, ANALYSIS_TOOLS_SQL),
     };
     anyhow::ensure!(options.limit > 0, "--limit must be greater than zero");
     anyhow::ensure!(
@@ -3526,7 +3909,7 @@ fn query_inputs(
             sql,
         )),
         (None, Some(legacy_sql), None) => Ok((
-            Some(resolve_default_warehouse(settings_override)?),
+            Some(resolve_default_pin(settings_override)?),
             legacy_sql.clone(),
         )),
         (None, Some(dataset), Some(legacy_sql)) => Ok((

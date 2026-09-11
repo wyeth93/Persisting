@@ -9,15 +9,9 @@ inputs:
     description: "Rust toolchain"
     required: false
     default: "stable"
-  install-protoc:
-    description: "Install the legacy native protobuf compiler when explicitly required"
-    required: false
-    default: "false"
   components:
     description: "Rust components (comma-separated)"
     required: false
-    # rust-src keeps the opt-in `just sanitize` (-Z build-std) path usable in
-    # CI without changing the normal build commands.
     default: "rustfmt, clippy, rust-src"
   install-dioxus:
     description: "Install the pinned Dioxus CLI and wasm target"
@@ -84,21 +78,3 @@ runs:
       if: inputs.install-dioxus == 'true'
       shell: bash
       run: dx --version
-
-    - name: Install protoc
-      if: inputs.install-protoc == 'true' && runner.os == 'Linux'
-      shell: bash
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq --no-install-recommends \
-          protobuf-compiler \
-          libprotobuf-dev
-        protoc --version
-        test -f /usr/include/google/protobuf/empty.proto
-
-    - name: Install protoc
-      if: inputs.install-protoc == 'true' && runner.os == 'macOS'
-      shell: bash
-      run: |
-        brew install protobuf
-        protoc --version

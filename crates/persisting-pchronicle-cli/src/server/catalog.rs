@@ -40,14 +40,39 @@ pub(crate) struct CatalogAcl {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogFile {
     #[serde(default)]
-    libraries: BTreeMap<String, CatalogLibraryFile>,
+    meta: Option<CatalogMeta>,
     #[serde(default)]
     users: BTreeMap<String, CatalogUserFile>,
+    #[serde(default)]
+    datasets: BTreeMap<String, CatalogLibraryFile>,
+    #[serde(default)]
+    grants: Vec<CatalogGrantFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogMeta {
+    version: u32,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogGrantFile {
+    user: String,
+    dataset: String,
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogLibraryFile {
     uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,11 +86,10 @@ struct CatalogLibraryFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogUserFile {
     access_key: String,
     secret_key: String,
-    #[serde(default)]
-    datasets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,10 +106,6 @@ impl CatalogAcl {
 
     pub(crate) fn parse(content: &str) -> Result<Self> {
         let file = parse_catalog_file(content)?;
-        anyhow::ensure!(
-            !file.users.is_empty(),
-            "catalog config needs at least one user"
-        );
         Self::from_document(file)
     }
 
@@ -95,6 +115,23 @@ impl CatalogAcl {
             users_by_access_key: build_users(&file, &libraries)?,
             libraries,
         })
+    }
+
+    pub(crate) fn mounts(&self) -> Result<Vec<DatasetMount>> {
+        self.libraries
+            .values()
+            .map(|library| DatasetMount::new(&library.name, &library.uri))
+            .collect()
+    }
+
+    pub(crate) fn apply_backend_env(&self) {
+        if let Some(library) = self
+            .libraries
+            .values()
+            .find(|library| library.access_key.is_some())
+        {
+            apply_library_env(library);
+        }
     }
 
     pub(crate) fn authenticate(&self, access_key: &str, secret_key: &str) -> Option<&CatalogUser> {
@@ -140,7 +177,6 @@ pub(crate) fn issue_user(path: &Path, name: &str) -> Result<IssuedUser> {
         CatalogUserFile {
             access_key: access_key.clone(),
             secret_key: secret_key.clone(),
-            datasets: Vec::new(),
         },
     );
     write_catalog_file(path, &file)?;
@@ -155,17 +191,27 @@ pub(crate) fn grant_datasets(path: &Path, name: &str, datasets: &[String]) -> Re
     let name = canonical_user_name(name)?;
     let mut file = load_editable_catalog(path)?;
     let library_names = canonical_library_names(&file)?;
-    let user = file
-        .users
-        .get_mut(&name)
-        .ok_or_else(|| anyhow!("unknown user '{name}'"))?;
+    anyhow::ensure!(file.users.contains_key(&name), "unknown user '{name}'");
     for dataset in datasets {
         let dataset = granted_library_name(&library_names, dataset)?;
-        if !user.datasets.iter().any(|existing| existing == &dataset) {
-            user.datasets.push(dataset);
+        if !file
+            .grants
+            .iter()
+            .any(|grant| grant.user == name && grant.dataset == dataset)
+        {
+            file.grants.push(CatalogGrantFile {
+                user: name.clone(),
+                dataset,
+                permissions: vec!["read".into(), "query".into(), "analyze".into()],
+            });
         }
     }
-    let granted = user.datasets.clone();
+    let granted = file
+        .grants
+        .iter()
+        .filter(|grant| grant.user == name)
+        .map(|grant| grant.dataset.clone())
+        .collect();
     write_catalog_file(path, &file)?;
     Ok(granted)
 }
@@ -173,29 +219,186 @@ pub(crate) fn grant_datasets(path: &Path, name: &str, datasets: &[String]) -> Re
 pub(crate) fn revoke_datasets(path: &Path, name: &str, datasets: &[String]) -> Result<Vec<String>> {
     let name = canonical_user_name(name)?;
     let mut file = load_editable_catalog(path)?;
-    let user = file
-        .users
-        .get_mut(&name)
-        .ok_or_else(|| anyhow!("unknown user '{name}'"))?;
+    anyhow::ensure!(file.users.contains_key(&name), "unknown user '{name}'");
     let mut to_remove = Vec::new();
     for dataset in datasets {
         let dataset = DatasetMount::new(dataset, "validation")
             .with_context(|| format!("catalog library name '{dataset}'"))?
             .name;
         anyhow::ensure!(
-            user.datasets.iter().any(|existing| existing == &dataset),
+            file.grants
+                .iter()
+                .any(|grant| grant.user == name && grant.dataset == dataset),
             "catalog user '{name}' does not grant '{dataset}'"
         );
         to_remove.push(dataset);
     }
-    user.datasets
-        .retain(|existing| !to_remove.iter().any(|dataset| dataset == existing));
-    let remaining = user.datasets.clone();
+    file.grants.retain(|grant| {
+        !(grant.user == name && to_remove.iter().any(|dataset| dataset == &grant.dataset))
+    });
+    let remaining = file
+        .grants
+        .iter()
+        .filter(|grant| grant.user == name)
+        .map(|grant| grant.dataset.clone())
+        .collect();
     write_catalog_file(path, &file)?;
     Ok(remaining)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DatasetAddSpec {
+    pub name: String,
+    pub uri: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+}
+
+pub(crate) fn add_dataset(path: &Path, spec: DatasetAddSpec) -> Result<CatalogLibraryPublic> {
+    let name = DatasetMount::new(&spec.name, "validation")
+        .with_context(|| format!("catalog dataset name '{}'", spec.name))?
+        .name;
+    anyhow::ensure!(
+        name == spec.name,
+        "catalog dataset '{}' must match [A-Za-z_][A-Za-z0-9_]* in lowercase",
+        spec.name
+    );
+    let mut file = load_editable_catalog(path)?;
+    anyhow::ensure!(
+        !file.datasets.contains_key(&name),
+        "catalog dataset '{name}' already exists"
+    );
+    let location = DatasetLocation::parse(&spec.uri)
+        .with_context(|| format!("catalog dataset '{name}' URI"))?;
+    let uri = location.as_str().to_owned();
+    let is_s3 = uri.starts_with("s3://");
+    let access_key = spec
+        .access_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let secret_key = spec
+        .secret_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    match (access_key.as_ref(), secret_key.as_ref(), is_s3) {
+        (None, None, false) => {}
+        (Some(_), Some(_), true) => {}
+        (None, None, true) => anyhow::bail!(
+            "catalog dataset '{name}' is s3:// and must set --access-key and --secret-key"
+        ),
+        (Some(_), Some(_), false) => {
+            anyhow::bail!("catalog dataset '{name}' is not s3:// and must not set backend keys")
+        }
+        _ => anyhow::bail!("catalog dataset '{name}' must set both --access-key and --secret-key"),
+    }
+    if is_s3 {
+        ensure_s3_credentials_match_existing(
+            &file,
+            access_key.as_deref(),
+            secret_key.as_deref(),
+            spec.endpoint.as_deref(),
+            spec.region.as_deref(),
+        )?;
+    }
+    file.datasets.insert(
+        name.clone(),
+        CatalogLibraryFile {
+            uri: uri.clone(),
+            endpoint: spec.endpoint.clone(),
+            region: spec.region.clone(),
+            access_key,
+            secret_key,
+        },
+    );
+    // Validate full document before persist.
+    let _ = build_libraries(&file)?;
+    write_catalog_file(path, &file)?;
+    Ok(CatalogLibraryPublic {
+        name,
+        uri,
+        endpoint: spec.endpoint,
+        region: spec.region,
+    })
+}
+
+pub(crate) fn remove_datasets(path: &Path, names: &[String]) -> Result<Vec<String>> {
+    let mut file = load_editable_catalog(path)?;
+    let library_names = canonical_library_names(&file)?;
+    let mut to_remove = Vec::new();
+    for name in names {
+        let name = granted_library_name(&library_names, name)?;
+        let still_granted = file
+            .grants
+            .iter()
+            .filter(|grant| grant.dataset == name)
+            .map(|grant| grant.user.as_str())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            still_granted.is_empty(),
+            "catalog dataset '{name}' is still granted to {}",
+            still_granted.join(", ")
+        );
+        to_remove.push(name);
+    }
+    for name in &to_remove {
+        file.datasets.remove(name);
+    }
+    anyhow::ensure!(
+        !file.datasets.is_empty() || file.users.is_empty(),
+        "catalog config needs at least one dataset while users remain"
+    );
+    if !file.datasets.is_empty() {
+        let _ = build_libraries(&file)?;
+    }
+    write_catalog_file(path, &file)?;
+    Ok(file.datasets.keys().cloned().collect())
+}
+
+pub(crate) fn list_datasets_config(path: &Path) -> Result<Vec<CatalogLibraryPublic>> {
+    let file = load_editable_catalog(path)?;
+    if file.datasets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let libraries = build_libraries(&file)?;
+    Ok(libraries.values().map(CatalogLibraryPublic::from).collect())
+}
+
+fn ensure_s3_credentials_match_existing(
+    file: &CatalogFile,
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    endpoint: Option<&str>,
+    region: Option<&str>,
+) -> Result<()> {
+    for (name, library) in &file.datasets {
+        let uri = DatasetLocation::parse(&library.uri)
+            .with_context(|| format!("catalog library '{name}' URI"))?
+            .as_str()
+            .to_owned();
+        if !uri.starts_with("s3://") {
+            continue;
+        }
+        anyhow::ensure!(
+            library.access_key.as_deref().map(str::trim) == access_key
+                && library.secret_key.as_deref().map(str::trim) == secret_key
+                && library.endpoint.as_deref() == endpoint
+                && library.region.as_deref() == region,
+            "catalog s3 datasets must share the same endpoint, region, and backend keys (differs from '{name}')"
+        );
+    }
+    Ok(())
+}
+
 fn read_catalog_config(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok("[meta]\nversion = 1\nrevision = 0\n".to_owned());
+    }
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("read catalog config metadata {}", path.display()))?;
     anyhow::ensure!(metadata.is_file(), "catalog config must be a regular file");
@@ -212,6 +415,9 @@ fn parse_catalog_file(content: &str) -> Result<CatalogFile> {
 
 fn load_editable_catalog(path: &Path) -> Result<CatalogFile> {
     let file = parse_catalog_file(&read_catalog_config(path)?)?;
+    if file.datasets.is_empty() && file.users.is_empty() && file.grants.is_empty() {
+        return Ok(file);
+    }
     let libraries = build_libraries(&file)?;
     build_users(&file, &libraries)?;
     Ok(file)
@@ -219,6 +425,10 @@ fn load_editable_catalog(path: &Path) -> Result<CatalogFile> {
 
 fn write_catalog_file(path: &Path, file: &CatalogFile) -> Result<()> {
     let serialized = toml::to_string_pretty(file).context("serialize catalog config")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create catalog config directory {}", parent.display()))?;
+    }
     let tmp_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -233,12 +443,11 @@ fn write_catalog_file(path: &Path, file: &CatalogFile) -> Result<()> {
 
 fn build_libraries(file: &CatalogFile) -> Result<BTreeMap<String, CatalogLibrary>> {
     anyhow::ensure!(
-        !file.libraries.is_empty(),
-        "catalog config needs at least one library"
+        !file.datasets.is_empty(),
+        "catalog config needs at least one dataset"
     );
     let mut libraries = BTreeMap::new();
-    let mut s3_credential: Option<(Option<String>, Option<String>, String, String)> = None;
-    for (name, library) in &file.libraries {
+    for (name, library) in &file.datasets {
         let mount = DatasetMount::new(name, "validation")
             .with_context(|| format!("catalog library name '{name}'"))?;
         let location = DatasetLocation::parse(&library.uri)
@@ -265,19 +474,6 @@ fn build_libraries(file: &CatalogFile) -> Result<BTreeMap<String, CatalogLibrary
                     !secret_key.is_empty(),
                     "catalog library '{name}' secret_key is empty"
                 );
-                let tuple = (
-                    library.endpoint.clone(),
-                    library.region.clone(),
-                    access_key.to_owned(),
-                    secret_key.to_owned(),
-                );
-                match &s3_credential {
-                    None => s3_credential = Some(tuple),
-                    Some(existing) => anyhow::ensure!(
-                        existing == &tuple,
-                        "all s3:// libraries must share the same endpoint, region, and backend keys"
-                    ),
-                }
             }
             _ => anyhow::bail!("catalog library '{name}' must set both access_key and secret_key"),
         }
@@ -307,6 +503,27 @@ fn build_users(
     libraries: &BTreeMap<String, CatalogLibrary>,
 ) -> Result<HashMap<String, CatalogUser>> {
     let mut users_by_access_key = HashMap::new();
+    let mut datasets_by_user: HashMap<String, Vec<String>> = HashMap::new();
+    for grant in &file.grants {
+        anyhow::ensure!(
+            file.users.contains_key(&grant.user),
+            "catalog grant references unknown user '{}'",
+            grant.user
+        );
+        anyhow::ensure!(
+            libraries.contains_key(&grant.dataset),
+            "catalog grant references unknown dataset '{}'",
+            grant.dataset
+        );
+        let entry = datasets_by_user.entry(grant.user.clone()).or_default();
+        anyhow::ensure!(
+            !entry.contains(&grant.dataset),
+            "catalog grant for user '{}' and dataset '{}' is duplicated",
+            grant.user,
+            grant.dataset
+        );
+        entry.push(grant.dataset.clone());
+    }
     for (name, user) in &file.users {
         let access_key = user.access_key.trim().to_owned();
         let secret_key = user.secret_key.trim().to_owned();
@@ -318,16 +535,10 @@ fn build_users(
             !secret_key.is_empty(),
             "catalog user '{name}' secret_key is empty"
         );
-        for dataset in &user.datasets {
-            anyhow::ensure!(
-                libraries.contains_key(dataset),
-                "catalog user '{name}' grants unknown library '{dataset}'"
-            );
-        }
         let catalog_user = CatalogUser {
             name: name.clone(),
             secret_key,
-            datasets: user.datasets.clone(),
+            datasets: datasets_by_user.remove(name).unwrap_or_default(),
         };
         anyhow::ensure!(
             users_by_access_key
@@ -350,22 +561,22 @@ fn canonical_user_name(name: &str) -> Result<String> {
 }
 
 fn canonical_library_names(file: &CatalogFile) -> Result<BTreeSet<String>> {
-    file.libraries
+    file.datasets
         .keys()
         .map(|name| {
             DatasetMount::new(name, "validation")
                 .map(|mount| mount.name)
-                .with_context(|| format!("catalog library name '{name}'"))
+                .with_context(|| format!("catalog dataset name '{name}'"))
         })
         .collect()
 }
 
 fn granted_library_name(library_names: &BTreeSet<String>, dataset: &str) -> Result<String> {
     let mount = DatasetMount::new(dataset, "validation")
-        .with_context(|| format!("catalog library name '{dataset}'"))?;
+        .with_context(|| format!("catalog dataset name '{dataset}'"))?;
     anyhow::ensure!(
         library_names.contains(&mount.name),
-        "unknown library '{dataset}'"
+        "unknown dataset '{dataset}'"
     );
     Ok(mount.name)
 }
@@ -406,7 +617,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CatalogLibraryPublic {
     pub name: String,
     pub uri: String,
@@ -440,6 +651,7 @@ pub(crate) fn apply_library_env(library: &CatalogLibrary) {
     if let Some(region) = library.region.as_deref() {
         unsafe {
             std::env::set_var("AWS_REGION", region);
+            std::env::set_var("AWS_DEFAULT_REGION", region);
         }
     }
     if let (Some(access_key), Some(secret_key)) =
@@ -456,43 +668,43 @@ pub(super) fn catalog_unauthorized() -> ApiError {
     ApiError::unauthorized("catalog credentials are invalid")
 }
 
-pub(crate) fn parse_catalog_alias_target(input: &str) -> Result<String> {
+pub(crate) fn parse_catalog_pin_target(input: &str) -> Result<String> {
     let input = input.trim();
-    let url = Url::parse(input).context("parse catalog alias URL")?;
+    let url = Url::parse(input).context("parse catalog pin URL")?;
     anyhow::ensure!(
         url.scheme() == "catalog",
-        "catalog alias target must use catalog://"
+        "catalog pin target must use catalog://"
     );
     anyhow::ensure!(
         url.username().is_empty() && url.password().is_none(),
-        "catalog alias URL must not contain embedded credentials"
+        "catalog pin URL must not contain embedded credentials"
     );
     anyhow::ensure!(
         url.query().is_none() && url.fragment().is_none(),
-        "catalog alias URL must not contain a query string or fragment"
+        "catalog pin URL must not contain a query string or fragment"
     );
     anyhow::ensure!(
         url.path() == "/" || url.path().is_empty(),
-        "catalog alias URL must not contain a path"
+        "catalog pin URL must not contain a path"
     );
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("catalog alias URL must include a host"))?;
+        .ok_or_else(|| anyhow!("catalog pin URL must include a host"))?;
     let address: std::net::IpAddr = host
         .parse()
-        .with_context(|| format!("catalog alias host '{host}' must be a loopback IP"))?;
+        .with_context(|| format!("catalog pin host '{host}' must be a loopback IP"))?;
     anyhow::ensure!(
         address.is_loopback(),
-        "catalog alias host must be a loopback address"
+        "catalog pin host must be a loopback address"
     );
     let port = url
         .port()
-        .ok_or_else(|| anyhow!("catalog alias URL must include a port"))?;
+        .ok_or_else(|| anyhow!("catalog pin URL must include a port"))?;
     Ok(format!("catalog://{host}:{port}"))
 }
 
 pub(crate) fn catalog_http_base(catalog_url: &str) -> Result<String> {
-    let normalized = parse_catalog_alias_target(catalog_url)?;
+    let normalized = parse_catalog_pin_target(catalog_url)?;
     Ok(normalized.replacen("catalog://", "http://", 1))
 }
 
@@ -585,7 +797,10 @@ pub(super) async fn catalog_data_plane_layer(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    if state.catalog_query_worker || state.catalog_acl.is_none() {
+    if state.catalog_query_worker
+        || state.catalog_acl.is_none()
+        || !state.config.datasets.is_empty()
+    {
         return next.run(request).await;
     }
     let path = request.uri().path().to_owned();
@@ -796,14 +1011,14 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-[libraries.prod]
+[datasets.prod]
 uri = "s3://bucket/prod"
 endpoint = "http://127.0.0.1:9000"
 region = "us-west-2"
 access_key = "BACKEND_AK"
 secret_key = "BACKEND_SK"
 
-[libraries.evals]
+[datasets.evals]
 uri = "s3://bucket/evals"
 endpoint = "http://127.0.0.1:9000"
 region = "us-west-2"
@@ -813,49 +1028,63 @@ secret_key = "BACKEND_SK"
 [users.alice]
 access_key = "USER_AK"
 secret_key = "USER_SK"
-datasets = ["prod", "evals"]
 
 [users.bob]
 access_key = "BOB_AK"
 secret_key = "BOB_SK"
-datasets = ["evals"]
+
+[[grants]]
+user = "alice"
+dataset = "prod"
+permissions = ["read", "query", "analyze"]
+
+[[grants]]
+user = "alice"
+dataset = "evals"
+permissions = ["read", "query", "analyze"]
+
+[[grants]]
+user = "bob"
+dataset = "evals"
+permissions = ["read", "query"]
 "#;
 
     #[test]
     fn parse_rejects_unknown_grant() {
         let error = CatalogAcl::parse(
             r#"
-[libraries.prod]
+[datasets.prod]
 uri = "s3://bucket/prod"
 access_key = "a"
 secret_key = "b"
 [users.alice]
 access_key = "u"
 secret_key = "s"
-datasets = ["missing"]
+
+[[grants]]
+user = "alice"
+dataset = "missing"
 "#,
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("unknown library 'missing'"), "{error}");
+        assert!(error.contains("unknown dataset 'missing'"), "{error}");
     }
 
     #[test]
     fn parse_rejects_duplicate_user_keys() {
         let error = CatalogAcl::parse(
             r#"
-[libraries.prod]
+[datasets.prod]
 uri = "s3://bucket/prod"
 access_key = "a"
 secret_key = "b"
 [users.alice]
 access_key = "same"
 secret_key = "s1"
-datasets = ["prod"]
 [users.bob]
 access_key = "same"
 secret_key = "s2"
-datasets = ["prod"]
 "#,
         )
         .unwrap_err()
@@ -864,26 +1093,53 @@ datasets = ["prod"]
     }
 
     #[test]
-    fn parse_rejects_mismatched_s3_backend_keys() {
-        let error = CatalogAcl::parse(
+    fn parse_accepts_independent_s3_backend_keys() {
+        let result = CatalogAcl::parse(
             r#"
-[libraries.prod]
+[datasets.prod]
 uri = "s3://bucket/prod"
 access_key = "a"
 secret_key = "b"
-[libraries.evals]
+[datasets.evals]
 uri = "s3://bucket/evals"
 access_key = "c"
 secret_key = "d"
 [users.alice]
 access_key = "u"
 secret_key = "s"
-datasets = ["prod"]
+
+[users.bob]
+access_key = "bob-ak"
+secret_key = "bob-sk"
+
+[[grants]]
+user = "alice"
+dataset = "prod"
+permissions = ["read", "query"]
+
+[[grants]]
+user = "alice"
+dataset = "evals"
+permissions = ["read", "query"]
 "#,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("share the same"), "{error}");
+        .unwrap();
+        let alice = result.authenticate("u", "s").unwrap();
+        for (name, uri, access_key, secret_key) in [
+            ("prod", "s3://bucket/prod", "a", "b"),
+            ("evals", "s3://bucket/evals", "c", "d"),
+        ] {
+            let ticket = result.ticket_for(alice, name).unwrap();
+            assert_eq!(ticket.name, name);
+            assert_eq!(ticket.uri, uri);
+            assert_eq!(ticket.access_key.as_deref(), Some(access_key));
+            assert_eq!(ticket.secret_key.as_deref(), Some(secret_key));
+        }
+
+        let bob = result.authenticate("bob-ak", "bob-sk").unwrap();
+        assert!(result.list_for(bob).is_empty());
+        assert!(result.ticket_for(bob, "prod").is_none());
+        assert!(result.ticket_for(bob, "evals").is_none());
     }
 
     #[test]
@@ -911,6 +1167,58 @@ datasets = ["prod"]
     }
 
     #[test]
+    fn canonical_datasets_and_grants_format_is_accepted() {
+        let acl = CatalogAcl::parse(
+            r#"
+[datasets.prod]
+uri = "s3://bucket/prod"
+access_key = "BACKEND_AK"
+secret_key = "BACKEND_SK"
+
+[users.alice]
+access_key = "USER_AK"
+secret_key = "USER_SK"
+
+[[grants]]
+user = "alice"
+dataset = "prod"
+permissions = ["read", "query"]
+"#,
+        )
+        .unwrap();
+        let user = acl.authenticate("USER_AK", "USER_SK").unwrap();
+        assert_eq!(acl.list_for(user)[0].name, "prod");
+        assert_eq!(
+            acl.ticket_for(user, "prod").unwrap().secret_key.as_deref(),
+            Some("BACKEND_SK")
+        );
+    }
+
+    #[test]
+    fn duplicate_canonical_grants_are_rejected() {
+        let error = CatalogAcl::parse(
+            r#"
+[datasets.prod]
+uri = "./prod"
+
+[users.alice]
+access_key = "USER_AK"
+secret_key = "USER_SK"
+
+[[grants]]
+user = "alice"
+dataset = "prod"
+
+[[grants]]
+user = "alice"
+dataset = "prod"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicated"));
+    }
+
+    #[test]
     fn public_list_omits_backend_secrets() {
         let acl = CatalogAcl::parse(SAMPLE).unwrap();
         let alice = acl.authenticate("USER_AK", "USER_SK").unwrap();
@@ -920,11 +1228,11 @@ datasets = ["prod"]
     }
 
     #[test]
-    fn catalog_alias_target_must_be_loopback_with_port() {
-        assert!(parse_catalog_alias_target("catalog://127.0.0.1:8081").is_ok());
-        assert!(parse_catalog_alias_target("catalog://8.8.8.8:8081").is_err());
-        assert!(parse_catalog_alias_target("catalog://127.0.0.1").is_err());
-        assert!(parse_catalog_alias_target("s3://bucket/prod").is_err());
+    fn catalog_pin_target_must_be_loopback_with_port() {
+        assert!(parse_catalog_pin_target("catalog://127.0.0.1:8081").is_ok());
+        assert!(parse_catalog_pin_target("catalog://8.8.8.8:8081").is_err());
+        assert!(parse_catalog_pin_target("catalog://127.0.0.1").is_err());
+        assert!(parse_catalog_pin_target("s3://bucket/prod").is_err());
     }
 
     #[test]
@@ -943,6 +1251,37 @@ datasets = ["prod"]
             .await
             .unwrap()
             .router()
+    }
+
+    #[tokio::test]
+    async fn prepare_catalog_mounts_local_datasets_without_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let left = temporary.path().join("left");
+        let right = temporary.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let catalog = temporary.path().join("catalog.toml");
+        std::fs::write(
+            &catalog,
+            format!(
+                r#"
+[datasets.left]
+uri = "{}"
+
+[datasets.right]
+uri = "{}"
+"#,
+                left.display(),
+                right.display()
+            ),
+        )
+        .unwrap();
+
+        let acl = CatalogAcl::load(&catalog).unwrap();
+        let warehouse = crate::server::PreparedWarehouse::prepare_catalog(acl)
+            .await
+            .unwrap();
+        assert_eq!(warehouse.dataset_names(), vec!["left", "right"]);
     }
 
     async fn catalog_body(response: axum::response::Response) -> (axum::http::StatusCode, String) {
@@ -1085,14 +1424,14 @@ datasets = ["prod"]
     }
 
     const LIBRARIES_ONLY: &str = r#"
-[libraries.prod]
+[datasets.prod]
 uri = "s3://bucket/prod"
 endpoint = "http://127.0.0.1:9000"
 region = "us-west-2"
 access_key = "BACKEND_AK"
 secret_key = "BACKEND_SK"
 
-[libraries.evals]
+[datasets.evals]
 uri = "s3://bucket/evals"
 endpoint = "http://127.0.0.1:9000"
 region = "us-west-2"
@@ -1126,9 +1465,131 @@ secret_key = "BACKEND_SK"
     }
 
     #[test]
-    fn parse_rejects_libraries_only_catalog() {
-        let error = CatalogAcl::parse(LIBRARIES_ONLY).unwrap_err().to_string();
-        assert!(error.contains("at least one user"), "{error}");
+    fn apply_catalog_backend_env_before_runtime_loads_s3_region() {
+        use clap::Parser;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("catalog.toml");
+        std::fs::write(
+            &catalog,
+            r#"
+[datasets.rfs]
+uri = "s3://test/test"
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+access_key = "123"
+secret_key = "123"
+"#,
+        )
+        .unwrap();
+        let catalog_arg = catalog.to_string_lossy().into_owned();
+        let cli = crate::Cli::try_parse_from([
+            "pchronicle",
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--catalog-config",
+            &catalog_arg,
+        ])
+        .unwrap();
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+        crate::apply_catalog_backend_env_before_runtime(&cli).unwrap();
+        assert_eq!(std::env::var("AWS_REGION").unwrap(), "us-east-1");
+        assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "123");
+    }
+
+    #[test]
+    fn apply_library_env_exports_region_for_opendal() {
+        let previous_region = std::env::var("AWS_REGION").ok();
+        let previous_default = std::env::var("AWS_DEFAULT_REGION").ok();
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+        apply_library_env(&CatalogLibrary {
+            name: "rfs".into(),
+            uri: "s3://test/test".into(),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            region: Some("us-east-1".into()),
+            access_key: Some("123".into()),
+            secret_key: Some("123".into()),
+        });
+        assert_eq!(std::env::var("AWS_REGION").unwrap(), "us-east-1");
+        assert_eq!(std::env::var("AWS_DEFAULT_REGION").unwrap(), "us-east-1");
+        assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "123");
+        assert_eq!(
+            std::env::var("AWS_ENDPOINT_URL_S3").unwrap(),
+            "http://127.0.0.1:9000"
+        );
+        unsafe {
+            match previous_region {
+                Some(value) => std::env::set_var("AWS_REGION", value),
+                None => std::env::remove_var("AWS_REGION"),
+            }
+            match previous_default {
+                Some(value) => std::env::set_var("AWS_DEFAULT_REGION", value),
+                None => std::env::remove_var("AWS_DEFAULT_REGION"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_allows_catalog_without_users() {
+        let acl = CatalogAcl::parse(LIBRARIES_ONLY).unwrap();
+        assert_eq!(
+            acl.mounts()
+                .unwrap()
+                .iter()
+                .map(|mount| mount.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evals", "prod"]
+        );
+    }
+
+    #[test]
+    fn add_and_remove_dataset_rewrites_catalog_without_touching_users() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.toml");
+        std::fs::write(&path, LIBRARIES_ONLY).unwrap();
+
+        let added = add_dataset(
+            &path,
+            DatasetAddSpec {
+                name: "local".into(),
+                uri: "/tmp/local-warehouse".into(),
+                endpoint: None,
+                region: None,
+                access_key: None,
+                secret_key: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(added.name, "local");
+        assert_eq!(added.uri, "/tmp/local-warehouse");
+
+        let listed = list_datasets_config(&path).unwrap();
+        assert!(listed.iter().any(|item| item.name == "local"));
+
+        let remaining = remove_datasets(&path, &["local".into()]).unwrap();
+        assert!(!remaining.iter().any(|name| name == "local"));
+        assert!(remaining.contains(&"prod".to_string()));
+    }
+
+    #[test]
+    fn remove_dataset_rejects_when_grants_still_reference_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.toml");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let error = remove_datasets(&path, &["prod".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("still granted") || error.contains("grant"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1148,7 +1609,7 @@ secret_key = "BACKEND_SK"
         assert_eq!(user.name, "alice");
         assert!(acl.list_for(user).is_empty());
         let stored = path_text(&path);
-        assert!(stored.contains("datasets = []"), "{stored}");
+        assert!(!stored.contains("datasets = ["), "{stored}");
         assert!(stored.contains(&issued.access_key), "{stored}");
         assert!(stored.contains(&issued.secret_key), "{stored}");
     }
@@ -1182,7 +1643,7 @@ secret_key = "BACKEND_SK"
             .unwrap_err()
             .to_string();
         assert!(
-            missing_library.contains("unknown library 'missing'"),
+            missing_library.contains("unknown dataset 'missing'"),
             "{missing_library}"
         );
 

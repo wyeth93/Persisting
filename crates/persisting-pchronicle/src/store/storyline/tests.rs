@@ -1,5 +1,6 @@
 use super::content::CONTENT_REF_MAGIC;
 use super::*;
+use crate::store::opendal_store::Store as OpendalStore;
 use crate::{StorylineAgent, StorylineToolCall, StorylineTurn};
 
 fn remote_uri(label: &str) -> String {
@@ -55,8 +56,13 @@ fn create_projection_cleanup_failure_is_not_silently_discarded() {
 }
 
 async fn put_remote_object(uri: &str, relative: &str, contents: &[u8]) {
-    let (store, root) = ObjectStore::from_uri(uri).await.unwrap();
-    store.put(&root.join(relative), contents).await.unwrap();
+    let store = crate::store::opendal_store::Store::from_uri(uri)
+        .await
+        .unwrap();
+    store
+        .write_overwrite(relative, contents.to_vec())
+        .await
+        .unwrap();
 }
 
 struct CreateAfterEmptyReadBarrier;
@@ -1529,6 +1535,82 @@ async fn invalid_storyline_does_not_move_current_generation() {
 }
 
 #[tokio::test]
+async fn maintenance_source_budgets_preserve_current_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StorylineLanceStore::open(dir.path()).await.unwrap();
+    let _suppress = SuppressInvertedIndexes::install(store.root_uri());
+    // The first fragment has indexes; the next six unindexed fragments form
+    // two three-row compaction tasks, only one of which fits the row budget.
+    let documents = (0..7)
+        .map(|i| story(&format!("budget-{i}")))
+        .collect::<Vec<_>>();
+    for document in &documents {
+        store.replace_storyline(document).await.unwrap();
+    }
+    let before = store.current_table_paths().await.unwrap().unwrap();
+    let mut options = LanceMaintenanceOptions {
+        target_rows_per_fragment: 3,
+        max_compaction_source_rows: Some(3),
+        max_compaction_source_bytes: Some(1),
+        optimize_indices: false,
+        vacuum_older_than: None,
+        ..Default::default()
+    };
+    let report = store.maintain(&options).await.unwrap();
+    assert_eq!(report.runs.fragments_removed, 0);
+    assert_eq!(report.steps.fragments_removed, 0);
+    assert_eq!(report.tool_calls.fragments_removed, 0);
+    options.max_compaction_source_bytes = None;
+    let report = store.maintain(&options).await.unwrap();
+    assert!(
+        report.runs.fragments_removed > 0 && report.runs.fragments_removed <= 3,
+        "{report:?}"
+    );
+    let after = store.current_table_paths().await.unwrap().unwrap();
+    assert_ne!(before.generation, after.generation);
+    for document in documents {
+        assert_eq!(
+            store
+                .get_storyline_full(&document.session_id)
+                .await
+                .unwrap(),
+            Some(document)
+        );
+    }
+    // Old snapshots remain readable; compaction only advances CURRENT.
+    assert_eq!(
+        open_table_version(&before.runs, before.runs_version)
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        7
+    );
+    for invalid in [
+        LanceMaintenanceOptions {
+            max_compaction_source_rows: Some(0),
+            ..Default::default()
+        },
+        LanceMaintenanceOptions {
+            max_compaction_source_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        assert!(store.maintain(&invalid).await.is_err());
+        assert_eq!(
+            store
+                .current_table_paths()
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            after.generation
+        );
+    }
+}
+
+#[tokio::test]
 async fn replace_defers_compaction_until_explicit_maintenance() {
     let dir = tempfile::tempdir().unwrap();
     let store = StorylineLanceStore::open(dir.path()).await.unwrap();
@@ -1774,6 +1856,7 @@ async fn live_writer_lease_rejects_maintenance_before_table_mutation() {
             optimize_indices: true,
             vacuum_older_than: None,
             target_rows_per_fragment: 1024,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -1999,13 +2082,20 @@ async fn object_store_rejects_invalid_utf8_unsafe_and_dangling_current() {
 
 #[tokio::test]
 async fn object_store_detects_partially_deleted_generation() {
-    let uri = remote_uri("partial-generation");
-    let store = StorylineLanceStore::open_uri(&uri).await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let uri = temp.path().to_string_lossy().into_owned();
+    let store = StorylineLanceStore::open(&uri).await.unwrap();
     store.replace_storyline(&story("session")).await.unwrap();
     let paths = store.current_table_paths().await.unwrap().unwrap();
-    let steps_uri = paths.steps.to_string_lossy().into_owned();
-    let (object_store, steps_root) = ObjectStore::from_uri(&steps_uri).await.unwrap();
-    object_store.remove_dir_all(steps_root).await.unwrap();
+    OpendalStore::from_uri(&uri)
+        .await
+        .unwrap()
+        .remove(&format!(
+            "{GENERATIONS_DIR}/{}/{}.lance",
+            paths.table_generation, STORY_STEPS_TABLE
+        ))
+        .await
+        .unwrap();
 
     let error = StorylineLanceStore::open_uri(&uri).await.unwrap_err();
     assert!(error.to_string().contains("is incomplete"), "{error:#}");
@@ -2295,13 +2385,6 @@ fn joins_object_store_locations_without_losing_uri_scheme() {
         "s3://bucket/轨迹/generations/gen-1"
     );
     assert!(normalize_root_uri("  ").is_err());
-}
-
-#[test]
-fn storyline_fts_indexes_default_to_case_insensitive_matching() {
-    let params = storyline_inverted_index_params(None);
-    let encoded = serde_json::to_value(params).expect("FTS parameters should serialize");
-    assert_eq!(encoded["lower_case"], true);
 }
 
 #[cfg(feature = "proptest")]

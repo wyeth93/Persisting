@@ -41,6 +41,14 @@ pub struct RunSummary {
     pub row_count: usize,
     pub duplicate_event_ids: usize,
     pub status: String,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct CompactRecordDetail {
+    pub run: RunSummary,
+    pub record: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -129,11 +137,15 @@ pub struct CatalogTreeChild {
     pub name: String,
     pub kind: String,
     #[serde(default)]
+    pub data_type: String,
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub run_count: usize,
     #[serde(default)]
     pub failed_count: usize,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
     #[serde(default)]
     pub entries: Vec<CatalogTreeChild>,
 }
@@ -304,6 +316,10 @@ pub fn queryable_tables(catalog: &QueryCatalog) -> Vec<QueryTableSummary> {
 }
 
 impl RunSummary {
+    pub fn is_compact_jsonl(&self) -> bool {
+        self.format.as_deref() == Some("compact-jsonl/v1")
+    }
+
     pub fn query(&self) -> String {
         let mut out = format!(
             "dataset={}&file={}",
@@ -602,6 +618,7 @@ mod tests {
             row_count: 2,
             duplicate_event_ids: 0,
             status: "ok".into(),
+            format: None,
         };
         assert_eq!(
             run.query(),
@@ -643,6 +660,23 @@ mod tests {
             page.records[0].run.query(),
             "dataset=captures&file=capture-comparison%2Fevents.lance&agent_id=capture-comparison&session_id=session-1"
         );
+    }
+
+    #[test]
+    fn compact_record_detail_keeps_raw_json() {
+        let detail: CompactRecordDetail = serde_json::from_value(serde_json::json!({
+            "run": {
+                "dataset": "records", "file": "data.lance", "run_id": null,
+                "agent_id": "compact-jsonl", "model_name": null, "session_id": "row-1",
+                "root_session_id": null, "path": "records/data.lance/row-1",
+                "row_count": 1, "duplicate_event_ids": 0, "status": "record",
+                "format": "compact-jsonl/v1"
+            },
+            "record": {"id": "row-1", "nested": {"ok": true}}
+        }))
+        .unwrap();
+        assert!(detail.run.is_compact_jsonl());
+        assert_eq!(detail.record["nested"]["ok"], true);
     }
 
     #[test]

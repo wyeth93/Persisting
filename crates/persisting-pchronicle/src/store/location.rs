@@ -5,10 +5,9 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use futures::TryStreamExt;
-use lance::io::ObjectStore;
-use object_store::PutMode;
 use url::Url;
+
+use super::opendal_store::Store as OpendalStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetLocationKind {
@@ -164,34 +163,47 @@ impl DatasetLocation {
         if let Some(path) = &self.local_path {
             return Ok(path.exists());
         }
-        let (store, root) = ObjectStore::from_uri(&self.uri)
-            .await
-            .map_err(|error| object_store_io_error("open object store", &self.uri, error))?;
-        let mut objects = store.inner.list(Some(&root));
-        objects
-            .try_next()
-            .await
-            .map_err(|error| object_store_io_error("list object-store prefix", &self.uri, error))
-            .map(|object| object.is_some())
+        let store = OpendalStore::from_uri(&self.uri).await?;
+        store.exists().await
     }
 
     pub async fn put_bytes(&self, bytes: &[u8], overwrite: bool) -> Result<()> {
         if let Some(path) = &self.local_path {
             return put_local_bytes(path, bytes, overwrite);
         }
-        let (store, root) = ObjectStore::from_uri(&self.uri)
-            .await
-            .map_err(|error| object_store_io_error("open object store", &self.uri, error))?;
-        let mode = if overwrite {
-            PutMode::Overwrite
+        let store = OpendalStore::from_uri(&self.uri).await?;
+        // DatasetLocation represents a prefix; use a stable marker inside it.
+        let path = ".dataset-marker";
+        if overwrite {
+            store.write_overwrite(path, bytes.to_vec()).await?;
         } else {
-            PutMode::Create
-        };
-        store
-            .inner
-            .put_opts(&root, bytes.to_vec().into(), mode.into())
-            .await
-            .map_err(|error| object_store_io_error("write object", &self.uri, error))?;
+            store.write_create(path, bytes.to_vec()).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove the complete Dataset represented by this local directory or
+    /// object-store prefix.
+    pub async fn remove_all(&self) -> Result<()> {
+        if let Some(path) = &self.local_path {
+            anyhow::ensure!(path.exists(), "Dataset does not exist: {}", self.uri);
+            anyhow::ensure!(
+                path.file_name().is_some(),
+                "refusing to drop a filesystem root as a Dataset"
+            );
+            anyhow::ensure!(path.is_dir(), "Dataset is not a directory: {}", self.uri);
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("drop local Dataset {}", path.display()))?;
+            return Ok(());
+        }
+
+        let url = Url::parse(&self.uri).context("parse Dataset URI for drop")?;
+        anyhow::ensure!(
+            !url.path().trim_matches('/').is_empty(),
+            "refusing to drop an entire object-store bucket; name a Dataset prefix"
+        );
+        let store = OpendalStore::from_uri(&self.uri).await?;
+        store.remove_all().await?;
         Ok(())
     }
 }
@@ -222,10 +234,7 @@ fn validate_object_store_bucket(scheme: &str, bucket: &str) -> Result<()> {
     Ok(())
 }
 
-fn object_store_io_error(action: &str, uri: &str, error: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!("{action} {uri}: {}", object_store_error_detail(&error))
-}
-
+#[cfg(test)]
 fn object_store_error_detail(error: &impl std::fmt::Display) -> String {
     let text = error.to_string();
     match xml_tag(&text, "Code") {
@@ -239,6 +248,7 @@ fn object_store_error_detail(error: &impl std::fmt::Display) -> String {
     }
 }
 
+#[cfg(test)]
 fn xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -421,5 +431,25 @@ mod tests {
         ))
         .unwrap();
         assert!(!location.exists().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_all_drops_local_dataset_directory() {
+        let temp = tempdir().unwrap();
+        let dataset = temp.path().join("dataset");
+        std::fs::create_dir(&dataset).unwrap();
+        std::fs::write(dataset.join("source.json"), b"{}").unwrap();
+        let location = DatasetLocation::parse(dataset.to_str().unwrap()).unwrap();
+
+        location.remove_all().await.unwrap();
+
+        assert!(!dataset.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_all_rejects_object_store_bucket_root() {
+        let location = DatasetLocation::parse("memory://bucket").unwrap();
+        let error = location.remove_all().await.unwrap_err().to_string();
+        assert!(error.contains("entire object-store bucket"), "{error}");
     }
 }

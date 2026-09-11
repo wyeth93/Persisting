@@ -1,10 +1,10 @@
 use crate::executor::{AttemptContext, RunExecutor};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::sandbox::INTERNAL_SANDBOX_ARG;
+use crate::sandbox::{INTERNAL_SANDBOX_ARG, NetworkIsolation};
 #[cfg(target_os = "macos")]
 use crate::sandbox::{MACOS_SANDBOX_EXEC, SEATBELT_ATTESTATION, SeatbeltPlan, seatbelt_profile};
 #[cfg(target_os = "linux")]
-use crate::sandbox::{ROOTLESS_ATTESTATION, SandboxPlan};
+use crate::sandbox::{ROOTLESS_ATTESTATION, SandboxPlan, landlock_runtime_available};
 use crate::sandbox::{SANDBOX_PLAN_ENV, SANDBOX_SETUP_FAILED_WARNING};
 use async_trait::async_trait;
 use persisting_agentctl::{
@@ -17,6 +17,8 @@ use persisting_agentctl::{FilesystemAccess, NetworkCapability};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -350,6 +352,15 @@ fn stdio(mode: StdioMode) -> Stdio {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn network_isolation(spec: &RunSpec) -> NetworkIsolation {
+    if matches!(spec.capabilities.network, NetworkCapability::Deny) {
+        NetworkIsolation::LoopbackOnly
+    } else {
+        NetworkIsolation::Ambient
+    }
+}
+
 fn resolve_host_program(program: &str) -> std::path::PathBuf {
     if program.contains(std::path::MAIN_SEPARATOR) {
         return program.into();
@@ -381,7 +392,7 @@ impl ProcessExecutor {
     ///
     /// The launcher must dispatch [`crate::sandbox::run_internal_if_requested`]
     /// before starting threads or an async runtime.  The `pvisor` binary is the
-    /// canonical launcher and uses this path automatically for `--safe` Runs.
+    /// canonical launcher and uses this path automatically for default host Runs.
     #[cfg(target_os = "linux")]
     pub fn rootless_with_launcher(launcher: impl Into<PathBuf>) -> std::io::Result<Self> {
         let launcher = launcher.into().canonicalize()?;
@@ -480,7 +491,15 @@ impl ProcessExecutor {
         {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
-            install_resource_limit_hook(&mut command, spec.runtime.resource_limits.clone());
+            let mut limits = spec.runtime.resource_limits.clone();
+            // RLIMIT_NPROC must be applied after the rootless launcher has
+            // created its private PID namespace and reaper. Applying it to
+            // the launcher itself can make setup fail with EAGAIN when the
+            // host user already has more processes than the requested cap.
+            if sandbox_plan.is_some() {
+                limits.processes = None;
+            }
+            install_resource_limit_hook(&mut command, limits);
         }
         if let Some(cwd) = &invocation.cwd {
             command.current_dir(cwd);
@@ -502,6 +521,22 @@ impl ProcessExecutor {
         }
         Ok(PreparedCommand { command, resources })
     }
+}
+
+/// Probe the namespace primitives used by the default Linux launcher without
+/// mutating the pVisor process itself.  A short-lived `unshare` child keeps the
+/// probe safe in a multithreaded Tokio process and distinguishes an unavailable
+/// host capability from a later Agent failure.
+#[cfg(target_os = "linux")]
+pub(crate) fn rootless_runtime_available() -> bool {
+    landlock_runtime_available()
+        && StdCommand::new("unshare")
+            .args(["--user", "--mount", "--pid", "--fork", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 #[cfg(unix)]
@@ -542,6 +577,7 @@ fn apply_resource_limits(limits: &ResourceLimits) -> std::io::Result<()> {
         }};
     }
 
+    #[cfg(not(target_os = "macos"))]
     if let Some(bytes) = limits.memory_bytes {
         set_limit!(libc::RLIMIT_AS, bytes);
     }
@@ -579,6 +615,7 @@ fn platform_launcher_command(
         )
     })?;
     let sandbox_root = SandboxResources::create()?;
+    let network = network_isolation(spec);
     let plan = rootless_plan(
         spec,
         invocation,
@@ -591,6 +628,7 @@ fn platform_launcher_command(
             .attestation_path()
             .expect("created rootless attestation")
             .to_owned(),
+        network,
     )?;
     let encoded = serde_json::to_string(&plan).map_err(std::io::Error::other)?;
     let mut command = Command::new(launcher);
@@ -658,8 +696,8 @@ fn platform_launcher_command(
         writable_paths.push(path);
     }
 
-    let deny_network = matches!(spec.capabilities.network, NetworkCapability::Deny);
-    let (allowed_unix_sockets, local_socket_roots) = if deny_network {
+    let network = network_isolation(spec);
+    let (allowed_unix_sockets, local_socket_roots) = if network.is_loopback_only() {
         (
             invocation
                 .env
@@ -683,14 +721,14 @@ fn platform_launcher_command(
         &writable_paths,
         &allowed_unix_sockets,
         &local_socket_roots,
-        deny_network,
+        network,
     )?;
     let plan = SeatbeltPlan {
         attestation: resources
             .attestation_path()
             .expect("created Seatbelt attestation")
             .to_owned(),
-        deny_network,
+        network,
     };
     let encoded = serde_json::to_string(&plan).map_err(std::io::Error::other)?;
 
@@ -738,6 +776,7 @@ fn rootless_plan(
     program: &Path,
     root: PathBuf,
     attestation: PathBuf,
+    network: NetworkIsolation,
 ) -> std::io::Result<SandboxPlan> {
     let cwd = invocation
         .cwd
@@ -816,7 +855,8 @@ fn rootless_plan(
         attestation,
         read_only,
         read_write,
-        deny_network: matches!(spec.capabilities.network, NetworkCapability::Deny),
+        network,
+        process_limit: spec.runtime.resource_limits.processes,
     })
 }
 

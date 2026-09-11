@@ -8,6 +8,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
@@ -36,10 +38,28 @@ const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 #[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_V1: u64 = (1 << 13) - 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_V2: u64 = (1 << 14) - 1;
+#[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_V3: u64 = (1 << 15) - 1;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_READ: u64 =
     LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NetworkIsolation {
+    Ambient,
+    LoopbackOnly,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl NetworkIsolation {
+    pub(crate) const fn is_loopback_only(self) -> bool {
+        matches!(self, Self::LoopbackOnly)
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,14 +69,18 @@ pub(crate) struct SandboxPlan {
     pub attestation: PathBuf,
     pub read_only: Vec<PathBuf>,
     pub read_write: Vec<PathBuf>,
-    pub deny_network: bool,
+    pub network: NetworkIsolation,
+    /// Applied after the private PID namespace is initialized so the trusted
+    /// launcher itself can still create its init/reaper process.
+    #[serde(default)]
+    pub process_limit: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SeatbeltPlan {
     pub attestation: PathBuf,
-    pub deny_network: bool,
+    pub network: NetworkIsolation,
 }
 
 /// Enter the hidden launcher when the first argument is the internal marker.
@@ -76,7 +100,6 @@ pub fn run_internal_if_requested() -> anyhow::Result<bool> {
 #[cfg(target_os = "linux")]
 fn run_internal() -> anyhow::Result<()> {
     use anyhow::{Context, bail};
-    use std::os::fd::AsRawFd;
 
     let encoded = std::env::var(SANDBOX_PLAN_ENV).context("missing rootless sandbox plan")?;
     let plan: SandboxPlan =
@@ -90,9 +113,12 @@ fn run_internal() -> anyhow::Result<()> {
         .context("rootless sandbox invocation is missing the Agent executable")?;
     let arguments = arguments.collect::<Vec<_>>();
 
-    enter_rootless_namespaces(plan.deny_network)
+    enter_rootless_namespaces(plan.network)
         .context("initialize rootless user and mount namespaces")?;
     enter_child_pid_namespace().context("initialize private PID namespace")?;
+    if let Some(limit) = plan.process_limit {
+        apply_process_limit(limit).context("apply Agent process limit")?;
+    }
     // Open the parent-owned inode before chroot/Landlock. The descriptor is
     // retained only by trusted setup code and closed before Agent execution,
     // so no attestation pathname needs to be projected into the sandbox.
@@ -106,6 +132,11 @@ fn run_internal() -> anyhow::Result<()> {
             )
         })?;
     enter_synthetic_root(&plan).context("construct private sandbox root")?;
+    // The private tmpfs created by `enter_synthetic_root` is writable by the
+    // Agent, but must also be present in the Landlock allowlist.  This uses the
+    // host-side mount path because rules are installed before chroot.
+    let mut plan = plan;
+    plan.read_write.push(PathBuf::from("/tmp"));
     std::env::set_current_dir(&plan.cwd)
         .with_context(|| format!("enter sandbox workspace {}", plan.cwd.display()))?;
 
@@ -124,7 +155,11 @@ fn run_internal() -> anyhow::Result<()> {
         std::env::set_var("PERSISTING_SANDBOX_USER_NAMESPACE", "1");
         std::env::set_var(
             "PERSISTING_SANDBOX_NETWORK",
-            if plan.deny_network { "deny" } else { "ambient" },
+            if plan.network.is_loopback_only() {
+                "deny"
+            } else {
+                "ambient"
+            },
         );
     }
 
@@ -182,7 +217,11 @@ fn run_internal() -> anyhow::Result<()> {
         std::env::set_var("PERSISTING_SANDBOX_FILESYSTEM", "seatbelt-write");
         std::env::set_var(
             "PERSISTING_SANDBOX_NETWORK",
-            if plan.deny_network { "deny" } else { "ambient" },
+            if plan.network.is_loopback_only() {
+                "deny"
+            } else {
+                "ambient"
+            },
         );
     }
 
@@ -193,13 +232,26 @@ fn run_internal() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn landlock_runtime_available() -> bool {
+    const CREATE_RULESET_VERSION: libc::c_uint = 1;
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0,
+            CREATE_RULESET_VERSION,
+        )
+    };
+    abi >= 1
+}
+
+#[cfg(target_os = "linux")]
 fn install_landlock(plan: &SandboxPlan) -> std::io::Result<u32> {
     use std::io::{Error, ErrorKind};
 
-    // ABI v3 is the minimum useful boundary for a writable workspace: v2
-    // controls cross-directory refer and v3 adds truncate.  Calling the small
-    // stable kernel ABI directly keeps this launcher dependency-free and makes
-    // unsupported hosts fail closed instead of silently degrading.
+    // Calling the small stable kernel ABI directly keeps this launcher
+    // dependency-free. Each kernel must only receive the access bits introduced
+    // by the ABI it implements: v2 adds REFER and v3 adds TRUNCATE.
     const CREATE_RULESET_VERSION: libc::c_uint = 1;
     const RULE_PATH_BENEATH: libc::c_int = 1;
     #[repr(C)]
@@ -218,16 +270,16 @@ fn install_landlock(plan: &SandboxPlan) -> std::io::Result<u32> {
     if abi < 0 {
         return Err(Error::last_os_error());
     }
-    if abi < 3 {
+    if abi < 1 {
         return Err(Error::new(
             ErrorKind::Unsupported,
-            format!("Landlock ABI v3 is required; kernel provides v{abi}"),
+            format!("Landlock ABI v1 or newer is required; kernel provides v{abi}"),
         ));
     }
 
-    let attr = RulesetAttr {
-        handled_access_fs: LANDLOCK_ACCESS_FS_V3,
-    };
+    let handled_access_fs = landlock_access_fs_for_abi(abi as u32);
+
+    let attr = RulesetAttr { handled_access_fs };
     let ruleset_fd = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -251,7 +303,7 @@ fn install_landlock(plan: &SandboxPlan) -> std::io::Result<u32> {
             })?;
     }
     for path in &plan.read_write {
-        add_landlock_path_rule(ruleset.0, path, LANDLOCK_ACCESS_FS_V3, RULE_PATH_BENEATH).map_err(
+        add_landlock_path_rule(ruleset.0, path, handled_access_fs, RULE_PATH_BENEATH).map_err(
             |error| {
                 Error::new(
                     error.kind(),
@@ -270,6 +322,15 @@ fn install_landlock(plan: &SandboxPlan) -> std::io::Result<u32> {
     Ok(abi as u32)
 }
 
+#[cfg(target_os = "linux")]
+const fn landlock_access_fs_for_abi(abi: u32) -> u64 {
+    match abi {
+        1 => LANDLOCK_ACCESS_FS_V1,
+        2 => LANDLOCK_ACCESS_FS_V2,
+        _ => LANDLOCK_ACCESS_FS_V3,
+    }
+}
+
 /// Confine the libkrun VMM process while leaving the pVisor FUSE server in the
 /// trusted parent. The VMM gets a private network and mount namespace, may
 /// access only its virtio-fs root plus KVM/runtime files, and retains no
@@ -282,7 +343,7 @@ pub(crate) fn restrict_krun_runner(
 ) -> anyhow::Result<u32> {
     use anyhow::Context;
 
-    enter_rootless_namespaces(true)
+    enter_rootless_namespaces(NetworkIsolation::LoopbackOnly)
         .context("initialize libkrun user, mount, and network namespaces")?;
     let mut read_only = [
         "/usr/lib",
@@ -310,7 +371,8 @@ pub(crate) fn restrict_krun_runner(
         attestation: PathBuf::from("/dev/null"),
         read_only,
         read_write,
-        deny_network: true,
+        network: NetworkIsolation::LoopbackOnly,
+        process_limit: None,
     };
     let abi = install_landlock(&plan).context("install libkrun Landlock policy")?;
     drop_process_capabilities().context("drop libkrun namespace capabilities")?;
@@ -389,6 +451,37 @@ impl Drop for OwnedFd {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn landlock_access_mask_matches_negotiated_abi() {
+        assert_eq!(landlock_access_fs_for_abi(1), LANDLOCK_ACCESS_FS_V1);
+        assert_eq!(landlock_access_fs_for_abi(2), LANDLOCK_ACCESS_FS_V2);
+        assert_eq!(landlock_access_fs_for_abi(3), LANDLOCK_ACCESS_FS_V3);
+        assert_eq!(landlock_access_fs_for_abi(99), LANDLOCK_ACCESS_FS_V3);
+        assert_eq!(LANDLOCK_ACCESS_FS_V2, LANDLOCK_ACCESS_FS_V1 | (1 << 13));
+        assert_eq!(
+            LANDLOCK_ACCESS_FS_V3,
+            LANDLOCK_ACCESS_FS_V2 | LANDLOCK_ACCESS_FS_TRUNCATE
+        );
+    }
+
+    #[test]
+    fn namespace_errors_preserve_stage_and_os_error() {
+        let error = with_io_context(
+            "unshare mount namespace",
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "unshare mount namespace: Operation not permitted (os error 1)"
+        );
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_internal() -> anyhow::Result<()> {
     anyhow::bail!("the local process sandbox is not available on this platform")
@@ -397,15 +490,15 @@ fn run_internal() -> anyhow::Result<()> {
 /// Generate a compatibility-oriented Seatbelt profile.
 ///
 /// Reads remain ambient so ordinary developer toolchains keep working. Every
-/// pathname write outside `writable_paths` is denied by Seatbelt. A deny-all
-/// network Run instead starts from `deny default` and admits only the exact
-/// Run-scoped Unix sockets plus sockets rooted in Run-owned directories.
+/// pathname write outside `writable_paths` is denied by Seatbelt. A
+/// network-isolated Run starts from `deny default` and admits loopback IP,
+/// exact Run-scoped Unix sockets, and sockets rooted in Run-owned directories.
 #[cfg(target_os = "macos")]
 pub(crate) fn seatbelt_profile(
     writable_paths: &[PathBuf],
     allowed_unix_sockets: &[PathBuf],
     local_socket_roots: &[PathBuf],
-    deny_network: bool,
+    network: NetworkIsolation,
 ) -> std::io::Result<(String, Vec<(String, PathBuf)>)> {
     use std::io::{Error, ErrorKind};
 
@@ -431,7 +524,7 @@ pub(crate) fn seatbelt_profile(
         parameters.push((key, path.clone()));
     }
 
-    if deny_network {
+    if network.is_loopback_only() {
         let allowed_unix_sockets = canonical_seatbelt_paths(allowed_unix_sockets, "Unix socket")?;
         let local_socket_roots = canonical_seatbelt_paths(local_socket_roots, "local socket root")?;
         parameters.reserve(allowed_unix_sockets.len() + local_socket_roots.len());
@@ -442,11 +535,12 @@ pub(crate) fn seatbelt_profile(
             parameters.push((format!("PVISOR_SOCKET_ROOT_{index}"), path.clone()));
         }
 
-        // Deny by default for a genuine no-network Run. The allowlist below is
+        // Deny by default for a network-isolated Run. The allowlist below is
         // intentionally small and mirrors the system services required by
         // shells, language runtimes, PTYs, and read-only preferences. Socket
         // operations are admitted only so the filtered denies below can retain
-        // Run-local Unix IPC while rejecting IP and ambient host Unix sockets.
+        // Run-local Unix IPC while rejecting non-loopback IP and ambient host
+        // Unix sockets.
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
@@ -477,7 +571,11 @@ pub(crate) fn seatbelt_profile(
              (allow network*)\n\
              (deny network-bind (local ip))\n\
              (deny network-inbound (local ip))\n\
-             (deny network-outbound (remote ip))\n",
+             (deny network-outbound\n\
+               (require-all\n\
+                 (remote ip)\n\
+                 (require-not (remote ip \"localhost:*\"))))\n\
+             (allow network-outbound (remote ip \"localhost:*\"))\n",
         );
         profile.push_str("(allow file-write*\n");
         for index in 0..writable_paths.len() {
@@ -553,17 +651,11 @@ fn canonical_seatbelt_paths(paths: &[PathBuf], kind: &str) -> std::io::Result<Ve
 }
 
 #[cfg(target_os = "linux")]
-fn enter_rootless_namespaces(deny_network: bool) -> std::io::Result<()> {
-    use std::io::Error;
-
+fn enter_rootless_namespaces(network: NetworkIsolation) -> std::io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
-    if deny_network {
-        flags |= libc::CLONE_NEWNET;
-    }
-    if unsafe { libc::unshare(flags) } != 0 {
-        return Err(Error::last_os_error());
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        return Err(namespace_stage_error("unshare user namespace"));
     }
 
     // A one-ID identity mapping is sufficient for a local Agent executable and
@@ -571,10 +663,28 @@ fn enter_rootless_namespaces(deny_network: bool) -> std::io::Result<()> {
     match std::fs::write("/proc/self/setgroups", b"deny\n") {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(with_io_context(
+                "disable setgroups in user namespace",
+                error,
+            ));
+        }
     }
-    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))?;
-    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))?;
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
+        .map_err(|error| with_io_context("write user namespace UID map", error))?;
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
+        .map_err(|error| with_io_context("write user namespace GID map", error))?;
+
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(namespace_stage_error("unshare mount namespace"));
+    }
+    if network.is_loopback_only() && unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        return Err(namespace_stage_error("unshare network namespace"));
+    }
+    if network.is_loopback_only() {
+        bring_loopback_up()
+            .map_err(|error| with_io_context("enable network namespace loopback", error))?;
+    }
 
     // Never propagate mounts performed by the child back into the host mount
     // namespace.  Landlock later prevents the Agent from changing topology.
@@ -588,14 +698,80 @@ fn enter_rootless_namespaces(deny_network: bool) -> std::io::Result<()> {
         )
     } != 0
     {
-        return Err(Error::last_os_error());
+        return Err(namespace_stage_error(
+            "set mount namespace root propagation to private",
+        ));
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
+fn bring_loopback_up() -> std::io::Result<()> {
+    // A newly-created network namespace starts with only `lo`, administratively
+    // down. Enable that interface before dropping capabilities; no route or
+    // non-loopback device is created, so children cannot reach the host network.
+    #[repr(C)]
+    struct Ifreq {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _guard = OwnedFd(fd);
+    let mut ifreq = Ifreq {
+        name: [0; libc::IFNAMSIZ],
+        flags: 0,
+        _pad: [0; 22],
+    };
+    ifreq.name[0] = b'l' as libc::c_char;
+    ifreq.name[1] = b'o' as libc::c_char;
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifreq) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    ifreq.flags |= libc::IFF_UP as libc::c_short | libc::IFF_RUNNING as libc::c_short;
+    if unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifreq) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_stage_error(stage: &str) -> std::io::Error {
+    with_io_context(stage, std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn with_io_context(stage: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
 fn enter_child_pid_namespace() -> std::io::Result<()> {
     if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_process_limit(processes: u64) -> std::io::Result<()> {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut current) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let requested = processes as libc::rlim_t;
+    let effective = requested.min(current.rlim_max);
+    let limit = libc::rlimit {
+        rlim_cur: effective,
+        rlim_max: effective,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -637,6 +813,27 @@ fn enter_synthetic_root(plan: &SandboxPlan) -> std::io::Result<()> {
             c"tmpfs".as_ptr(),
             libc::MS_NOSUID | libc::MS_NODEV,
             c"mode=0755,size=16m".as_ptr().cast(),
+        )
+    } != 0
+    {
+        return Err(Error::last_os_error());
+    }
+
+    // Give the Agent a private temporary directory.  Binding the host /tmp
+    // would let a staged Run mutate unrelated host state, while omitting it
+    // breaks ordinary tools that need a scratch directory.  This tmpfs is
+    // intentionally ephemeral and is not part of the durable workspace
+    // OverlayFS stage.
+    let tmp = plan.root.join("tmp");
+    std::fs::create_dir(&tmp)?;
+    let tmp = path_cstring(&tmp)?;
+    if unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            tmp.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            c"mode=1777,size=64m".as_ptr().cast(),
         )
     } != 0
     {
@@ -1059,15 +1256,22 @@ mod tests {
             .tempdir()
             .unwrap();
         let canonical = temporary.path().canonicalize().unwrap();
-        let (profile, parameters) =
-            seatbelt_profile(&[temporary.path().to_owned()], &[], &[], true).unwrap();
+        let (profile, parameters) = seatbelt_profile(
+            &[temporary.path().to_owned()],
+            &[],
+            &[],
+            NetworkIsolation::LoopbackOnly,
+        )
+        .unwrap();
 
         assert!(!profile.contains(canonical.to_str().unwrap()));
         assert_eq!(parameters, [("PVISOR_WRITABLE_0".into(), canonical)]);
         assert!(profile.contains("(deny default)"));
-        assert!(!profile.contains("(allow network-outbound"));
+        assert!(profile.contains("(remote ip \"localhost:*\")"));
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"));
 
-        let error = seatbelt_profile(&[PathBuf::from("/")], &[], &[], false).unwrap_err();
+        let error = seatbelt_profile(&[PathBuf::from("/")], &[], &[], NetworkIsolation::Ambient)
+            .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
